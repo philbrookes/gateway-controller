@@ -292,6 +292,22 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("should create a Service exposing listener ports", func(ctx context.Context) {
+		proxy := validProxy("svc")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.OwnerReferences).To(HaveLen(1))
+			gom.Expect(svc.OwnerReferences[0].Name).To(Equal(proxy.Name))
+			gom.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+			gom.Expect(svc.Spec.Ports).To(HaveLen(1))
+			gom.Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+			gom.Expect(svc.Spec.Ports[0].Name).To(Equal("http"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should handle deleted proxy gracefully", func(ctx context.Context) {
 		proxy := validProxy("deleted")
 		createProxy(ctx, proxy)

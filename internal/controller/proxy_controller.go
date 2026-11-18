@@ -8,6 +8,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -31,6 +32,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -76,6 +78,10 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	if err := r.reconcileDeployment(ctx, &proxy, revision); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile deployment: %w", err)
+	}
+
+	if err := r.reconcileService(ctx, &proxy); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
 
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
@@ -250,10 +256,50 @@ func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
 	return envVars
 }
 
+func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1alpha1.Proxy) error {
+	desired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxy.Name,
+			Namespace: proxy.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
+		if err := controllerutil.SetControllerReference(proxy, desired, r.Scheme); err != nil {
+			return err
+		}
+		desired.Spec.Selector = proxyLabels(proxy)
+		desired.Spec.Type = serviceType(proxy)
+		desired.Spec.Ports = buildServicePorts(proxy)
+		return nil
+	})
+	return err
+}
+
+func serviceType(proxy *proxyv1alpha1.Proxy) corev1.ServiceType {
+	if proxy.Spec.Service != nil && proxy.Spec.Service.Type != nil {
+		return corev1.ServiceType(*proxy.Spec.Service.Type)
+	}
+	return corev1.ServiceTypeClusterIP
+}
+
+func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
+	ports := make([]corev1.ServicePort, 0, len(proxy.Spec.Listeners))
+	for _, listener := range proxy.Spec.Listeners {
+		ports = append(ports, corev1.ServicePort{
+			Name:       listener.Name,
+			Port:       listener.Port,
+			TargetPort: intstr.FromString(listener.Name),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
+	return ports
+}
+
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.Proxy{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
