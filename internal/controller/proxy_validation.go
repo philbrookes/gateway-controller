@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 )
@@ -65,6 +66,24 @@ func joinValidationErrors(errs []string) string {
 		if remaining > 0 {
 			suffix := fmt.Sprintf("%s(and %d more)", sep, remaining)
 			if builder.Len()+needed+len(suffix) > maxConditionMessageLen {
+				avail := maxConditionMessageLen - builder.Len() - len(suffix)
+				if idx > 0 {
+					avail -= len(sep)
+				}
+				if avail <= 0 {
+					remaining++
+					suffix = fmt.Sprintf("%s(and %d more)", sep, remaining)
+					avail = maxConditionMessageLen - builder.Len() - len(suffix)
+					if idx > 0 {
+						avail -= len(sep)
+					}
+				}
+				if avail > 0 {
+					if idx > 0 {
+						builder.WriteString(sep)
+					}
+					builder.WriteString(truncateToRuneBoundary(err, avail))
+				}
 				builder.WriteString(suffix)
 				return builder.String()
 			}
@@ -72,7 +91,7 @@ func joinValidationErrors(errs []string) string {
 			if builder.Len() > 0 {
 				fmt.Fprintf(&builder, "%s(and 1 more)", sep)
 			} else {
-				builder.WriteString(err[:maxConditionMessageLen])
+				builder.WriteString(truncateToRuneBoundary(err, maxConditionMessageLen))
 			}
 			return builder.String()
 		}
@@ -82,4 +101,14 @@ func joinValidationErrors(errs []string) string {
 		builder.WriteString(err)
 	}
 	return builder.String()
+}
+
+func truncateToRuneBoundary(s string, maxBytes int) string {
+	if maxBytes >= len(s) {
+		return s
+	}
+	for maxBytes > 0 && !utf8.RuneStart(s[maxBytes]) {
+		maxBytes--
+	}
+	return s[:maxBytes]
 }

@@ -227,7 +227,7 @@ var _ = Describe("Proxy Controller", func() {
 		Expect(k8sClient.Delete(ctx, proxy)).To(Succeed())
 
 		Eventually(func(ctx context.Context) bool {
-			err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), proxy)
+			err := mgrClient.Get(ctx, client.ObjectKeyFromObject(proxy), &proxyv1alpha1.Proxy{})
 			return err != nil
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(BeTrue())
 

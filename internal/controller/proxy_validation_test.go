@@ -238,4 +238,59 @@ func TestJoinValidationErrors(t *testing.T) {
 			t.Errorf("expected length %d, got %d", maxConditionMessageLen, len(got))
 		}
 	})
+
+	t.Run("first large error with second error preserves content and indicates remainder", func(t *testing.T) {
+		t.Parallel()
+		// Create a first error that's 32,755 bytes (exceeds threshold when combined with suffix)
+		firstErr := "spec.filterChains[0].filters[2]: " + strings.Repeat("x", 32755-33)
+		secondErr := "spec.listeners[0]: references undefined chain"
+		errs := []string{firstErr, secondErr}
+		got := joinValidationErrors(errs)
+
+		// 1. Result must not exceed the limit
+		if len(got) > maxConditionMessageLen {
+			t.Fatalf("message length %d exceeds limit %d", len(got), maxConditionMessageLen)
+		}
+
+		// 2. Must contain content from the first error (shows what failed)
+		if !strings.HasPrefix(got, "spec.filterChains") {
+			t.Fatalf("result must start with first error content, got: %q", got)
+		}
+
+		// 3. Must indicate that there are more errors
+		if !strings.Contains(got, "(and 1 more)") {
+			t.Fatalf("result must indicate remaining errors, got: %q", got)
+		}
+	})
+
+	t.Run("three errors with large first truncates and counts all omitted", func(t *testing.T) {
+		t.Parallel()
+		firstErr := strings.Repeat("a", 32754)
+		errs := []string{firstErr, "b", "c"}
+		got := joinValidationErrors(errs)
+
+		if len(got) > maxConditionMessageLen {
+			t.Fatalf("message length %d exceeds limit %d", len(got), maxConditionMessageLen)
+		}
+		if !strings.HasSuffix(got, "; (and 2 more)") {
+			start := max(len(got)-20, 0)
+			t.Fatalf("expected suffix '; (and 2 more)', got tail: %q", got[start:])
+		}
+	})
+
+	t.Run("partial second error is not counted as omitted", func(t *testing.T) {
+		t.Parallel()
+		firstErr := strings.Repeat("a", 32750)
+		errs := []string{firstErr, "abc", "c"}
+		got := joinValidationErrors(errs)
+
+		if len(got) > maxConditionMessageLen {
+			t.Fatalf("message length %d exceeds limit %d", len(got), maxConditionMessageLen)
+		}
+		wantSuffix := "; ab; (and 1 more)"
+		if !strings.HasSuffix(got, wantSuffix) {
+			start := max(len(got)-30, 0)
+			t.Fatalf("expected suffix %q, got tail: %q", wantSuffix, got[start:])
+		}
+	})
 }
