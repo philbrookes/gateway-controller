@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -15,6 +16,11 @@ import (
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 )
 
+const (
+	containerName                 = "praxis"
+	defaultTerminationGracePeriod = int64(30)
+)
+
 type ProxyReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
@@ -24,6 +30,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -49,6 +56,9 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
 		metav1.ConditionTrue, "Valid", "Proxy specification is valid", proxy.Generation)
 
+	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
+		metav1.ConditionTrue, "ResolvedRefs", "All references resolved", proxy.Generation)
+
 	configData, err := renderProxyConfig(&proxy.Spec, proxy.Namespace)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("render config: %w", err)
@@ -63,7 +73,10 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 	proxy.Status.DesiredRevision = revision
-	proxy.Status.PublishedRevision = revision
+
+	if err := r.reconcileDeployment(ctx, &proxy, revision); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile deployment: %w", err)
+	}
 
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
 		metav1.ConditionTrue, "ConfigPublished", "Configuration rendered to ConfigMap", proxy.Generation)
@@ -96,9 +109,151 @@ func (r *ProxyReconciler) reconcileConfigMap(ctx context.Context, proxy *proxyv1
 	return err
 }
 
+const configRevisionAnnotation = "praxis.io/config-revision"
+
+func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv1alpha1.Proxy, revision string) error {
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxy.Name,
+			Namespace: proxy.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
+		if err := controllerutil.SetControllerReference(proxy, desired, r.Scheme); err != nil {
+			return err
+		}
+		replicas := int32(1)
+		if proxy.Spec.Replicas != nil {
+			replicas = *proxy.Spec.Replicas
+		}
+		desired.Spec.Replicas = &replicas
+		desired.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: proxyLabels(proxy),
+		}
+		desired.Spec.Template = buildPodTemplate(proxy, revision)
+		return nil
+	})
+	return err
+}
+
+func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
+	instance := proxy.Name
+	if len(instance) > maxLabelValueLen {
+		instance = instance[:maxLabelValueLen]
+	}
+	return map[string]string{
+		"app.kubernetes.io/name":       containerName,
+		"app.kubernetes.io/instance":   instance,
+		"app.kubernetes.io/managed-by": "gateway-controller",
+	}
+}
+
+func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTemplateSpec {
+	volumes, mounts := buildVolumes(proxy)
+	gracePeriod := defaultTerminationGracePeriod
+	container := corev1.Container{
+		Name:                     containerName,
+		Image:                    proxy.Spec.Image,
+		Command:                  []string{containerName},
+		Args:                     []string{"--config", configMountPath + "/" + configFileName},
+		Ports:                    buildContainerPorts(proxy),
+		VolumeMounts:             mounts,
+		Env:                      buildEnvVars(proxy),
+		ImagePullPolicy:          corev1.PullIfNotPresent,
+		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+	}
+	return corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: proxyLabels(proxy),
+			Annotations: map[string]string{
+				configRevisionAnnotation: revision,
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers:                    []corev1.Container{container},
+			Volumes:                       volumes,
+			RestartPolicy:                 corev1.RestartPolicyAlways,
+			DNSPolicy:                     corev1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: &gracePeriod,
+			SchedulerName:                 corev1.DefaultSchedulerName,
+		},
+	}
+}
+
+func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := []corev1.Volume{{
+		Name: configVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: configMapName(proxy)},
+			},
+		},
+	}}
+	mounts := []corev1.VolumeMount{{
+		Name:      configVolumeName,
+		MountPath: configMountPath + "/" + configFileName,
+		SubPath:   configSubPath,
+		ReadOnly:  true,
+	}}
+
+	for _, listener := range proxy.Spec.Listeners {
+		if listener.TLS == nil {
+			continue
+		}
+		volName := "tls-" + listener.Name
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: listener.TLS.CertificateRef.Name,
+				},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: fmt.Sprintf("%s/%s", tlsMountPrefix, listener.Name),
+			ReadOnly:  true,
+		})
+	}
+	return volumes, mounts
+}
+
+func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
+	ports := make([]corev1.ContainerPort, 0, len(proxy.Spec.Listeners))
+	for _, listener := range proxy.Spec.Listeners {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          listener.Name,
+			ContainerPort: listener.Port,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+	return ports
+}
+
+func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
+	if len(proxy.Spec.SecretEnv) == 0 {
+		return nil
+	}
+	envVars := make([]corev1.EnvVar, 0, len(proxy.Spec.SecretEnv))
+	for _, secretEnv := range proxy.Spec.SecretEnv {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: secretEnv.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretEnv.SecretRef.Name},
+					Key:                  secretEnv.SecretRef.Key,
+				},
+			},
+		})
+	}
+	return envVars
+}
+
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.Proxy{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }

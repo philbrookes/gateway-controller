@@ -6,6 +6,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -270,6 +271,25 @@ var _ = Describe("Proxy Controller", func() {
 			Namespace: proxy.Namespace,
 		}, cm)
 		Expect(err).To(HaveOccurred())
+	})
+
+	It("should create a Deployment with correct container spec", func(ctx context.Context) {
+		proxy := validProxy("deploy")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			gom.Expect(deploy.OwnerReferences).To(HaveLen(1))
+			gom.Expect(deploy.OwnerReferences[0].Name).To(Equal(proxy.Name))
+			gom.Expect(*deploy.Spec.Replicas).To(Equal(int32(1)))
+			containers := deploy.Spec.Template.Spec.Containers
+			gom.Expect(containers).To(HaveLen(1))
+			gom.Expect(containers[0].Image).To(Equal(proxy.Spec.Image))
+			gom.Expect(containers[0].Ports).To(HaveLen(1))
+			gom.Expect(containers[0].Ports[0].ContainerPort).To(Equal(int32(8080)))
+			gom.Expect(deploy.Spec.Template.Annotations).To(HaveKey("praxis.io/config-revision"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
 	It("should handle deleted proxy gracefully", func(ctx context.Context) {
