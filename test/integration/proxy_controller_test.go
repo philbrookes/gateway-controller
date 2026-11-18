@@ -6,8 +6,10 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -213,6 +215,61 @@ var _ = Describe("Proxy Controller", func() {
 			gom.Expect(cond.Reason).To(Equal("ValidationError"))
 			gom.Expect(proxy.Status.ObservedGeneration).To(Equal(proxy.Generation))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should create a ConfigMap with rendered config for a valid proxy", func(ctx context.Context) {
+		proxy := validProxy("cm-create")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			cm := &corev1.ConfigMap{}
+			gom.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      proxy.Name + "-config",
+				Namespace: proxy.Namespace,
+			}, cm)).To(Succeed())
+			gom.Expect(cm.Data).To(HaveKey("config.yaml"))
+			gom.Expect(cm.Data["config.yaml"]).To(ContainSubstring("listeners"))
+			gom.Expect(cm.OwnerReferences).To(HaveLen(1))
+			gom.Expect(cm.OwnerReferences[0].Name).To(Equal(proxy.Name))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should set Programmed condition and revision for a valid proxy", func(ctx context.Context) {
+		proxy := validProxy("programmed")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			gom.Expect(cond.Reason).To(Equal("ConfigPublished"))
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+			gom.Expect(got.Status.PublishedRevision).To(Equal(got.Status.DesiredRevision))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should not create ConfigMap for invalid proxy", func(ctx context.Context) {
+		proxy := validProxy("cm-no-create")
+		proxy.Spec.FilterChains = []proxyv1alpha1.ProxyFilterChain{{
+			Name: "chain",
+			Filters: []proxyv1alpha1.PraxisFilterEntry{
+				{Name: "dup", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
+				{Name: "dup", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
+			},
+		}}
+		proxy.Spec.Listeners[0].FilterChains = nil
+		createProxy(ctx, proxy)
+
+		expectValidationError(ctx, proxy, "duplicate entry name")
+
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      proxy.Name + "-config",
+			Namespace: proxy.Namespace,
+		}, cm)
+		Expect(err).To(HaveOccurred())
 	})
 
 	It("should handle deleted proxy gracefully", func(ctx context.Context) {
