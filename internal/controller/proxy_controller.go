@@ -60,24 +60,25 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
 		metav1.ConditionTrue, "Valid", "Proxy specification is valid", proxy.Generation)
 
-	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
-		metav1.ConditionTrue, "ResolvedRefs", "All references resolved", proxy.Generation)
-
 	configData, err := renderProxyConfig(&proxy.Spec, proxy.Namespace)
 	if err != nil {
 		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
+			metav1.ConditionFalse, "ConfigRenderError", err.Error(), proxy.Generation)
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
 			metav1.ConditionFalse, "ConfigRenderError", err.Error(), proxy.Generation)
 		if patchErr := r.Status().Patch(ctx, &proxy, patch); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, nil
 	}
+	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
+		metav1.ConditionTrue, "ResolvedRefs", "All references resolved", proxy.Generation)
 
 	if err := r.reconcileConfigMap(ctx, &proxy, configData); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile configmap: %w", err)
 	}
 
-	revision, err := computeRevision(configData)
+	revision, err := computeRevision(configData, proxy.Spec)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -155,13 +156,9 @@ func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv
 }
 
 func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
-	instance := proxy.Name
-	if len(instance) > maxLabelValueLen {
-		instance = instance[:maxLabelValueLen]
-	}
 	return map[string]string{
 		"app.kubernetes.io/name":       containerName,
-		"app.kubernetes.io/instance":   instance,
+		"app.kubernetes.io/instance":   proxy.Name,
 		"app.kubernetes.io/managed-by": "gateway-controller",
 	}
 }

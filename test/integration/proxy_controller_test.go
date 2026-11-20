@@ -94,7 +94,7 @@ var _ = Describe("Proxy Controller", func() {
 				{Name: "dup", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
 			},
 		}}
-		proxy.Spec.Listeners[0].FilterChains = nil
+		proxy.Spec.Listeners[0].FilterChains = []string{"chain"}
 		createProxy(ctx, proxy)
 
 		expectValidationError(ctx, proxy, "duplicate entry name")
@@ -109,7 +109,7 @@ var _ = Describe("Proxy Controller", func() {
 				{Name: "after", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
 			},
 		}}
-		proxy.Spec.Listeners[0].FilterChains = nil
+		proxy.Spec.Listeners[0].FilterChains = []string{"chain"}
 		createProxy(ctx, proxy)
 
 		expectValidationError(ctx, proxy, "terminal filter")
@@ -167,7 +167,7 @@ var _ = Describe("Proxy Controller", func() {
 				{Name: "after", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
 			},
 		}}
-		proxy.Spec.Listeners[0].FilterChains = nil
+		proxy.Spec.Listeners[0].FilterChains = []string{"chain"}
 		createProxy(ctx, proxy)
 
 		Eventually(func(gom Gomega, ctx context.Context) {
@@ -275,7 +275,7 @@ var _ = Describe("Proxy Controller", func() {
 				{Name: "dup", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
 			},
 		}}
-		proxy.Spec.Listeners[0].FilterChains = nil
+		proxy.Spec.Listeners[0].FilterChains = []string{"chain"}
 		createProxy(ctx, proxy)
 
 		expectValidationError(ctx, proxy, "duplicate entry name")
@@ -400,7 +400,36 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
-	It("should set Accepted=False with ConfigRenderError for unrenderable filter", func(ctx context.Context) {
+	It("should update revision when spec.image changes", func(ctx context.Context) {
+		proxy := validProxy("rev-image")
+		createProxy(ctx, proxy)
+
+		var origRevision string
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+			origRevision = got.Status.DesiredRevision
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.Image = "ghcr.io/praxis-proxy/praxis:v2"
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+			gom.Expect(got.Status.DesiredRevision).NotTo(Equal(origRevision))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should set Accepted=False and ResolvedRefs=False for unrenderable filter", func(ctx context.Context) {
 		proxy := validProxy("render-error")
 		proxy.Spec.FilterChains[0].Filters[0] = proxyv1alpha1.PraxisFilterEntry{
 			Name: "unknown",
@@ -413,11 +442,17 @@ var _ = Describe("Proxy Controller", func() {
 		createProxy(ctx, proxy)
 
 		Eventually(func(gom Gomega, ctx context.Context) {
-			cond := acceptedCondition(ctx, proxy)
-			gom.Expect(cond).NotTo(BeNil())
-			gom.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-			gom.Expect(cond.Reason).To(Equal("ConfigRenderError"))
-			gom.Expect(cond.Message).To(ContainSubstring("unsupported filter"))
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			accepted := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted)
+			gom.Expect(accepted).NotTo(BeNil())
+			gom.Expect(accepted.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(accepted.Reason).To(Equal("ConfigRenderError"))
+			gom.Expect(accepted.Message).To(ContainSubstring("unsupported filter"))
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(resolved.Reason).To(Equal("ConfigRenderError"))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
