@@ -46,6 +46,8 @@ make verify            # fail if generated or derived output is uncommitted
 
 Development follows the praxis-proxy [development conventions].
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull request requirements.
+
 ## Two-Branch Development Model
 
 This repository maintains two long-lived branches reflecting two API layers:
@@ -72,6 +74,8 @@ without taking a dependency on the full stack before it is ready.
   improvements
 - Never merge `aigateway` back to `main`; the history flows one direction only
 
+Shared changes (CI, documentation, shared utilities) land on `main` first, then
+flow to `aigateway` via rebase.
 Shared changes (CI, documentation, shared utilities) land on `main` first, then
 flow to `aigateway` via rebase.
 
