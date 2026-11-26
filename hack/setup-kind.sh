@@ -7,6 +7,7 @@ set -euo pipefail
 #
 # Override via environment:
 #   KIND_CLUSTER_NAME  cluster name (default: gateway-controller-dev)
+#   KIND_CONFIG        kind config (default: hack/kind-config.yaml)
 #   GWAPI_VERSION      Gateway API CRD version (default: v1.5.1)
 #   METALLB_VERSION    MetalLB version (default: v0.14.9)
 #
@@ -19,6 +20,7 @@ METALLB_VERSION="${METALLB_VERSION:-v0.14.9}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-$(command -v podman || command -v docker || true)}"
 KIND="${KIND:-kind}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+KIND_CONFIG="${KIND_CONFIG:-${SCRIPT_DIR}/kind-config.yaml}"
 KUBECTL="kubectl --context kind-${CLUSTER_NAME}"
 # Honor explicit KIND_EXPERIMENTAL_PROVIDER, otherwise derive from CONTAINER_ENGINE
 KIND_PROVIDER="${KIND_EXPERIMENTAL_PROVIDER:-$(basename "${CONTAINER_ENGINE}")}"
@@ -34,7 +36,7 @@ create_cluster() {
         echo "==> Creating KIND cluster '${CLUSTER_NAME}'..."
         KIND_EXPERIMENTAL_PROVIDER="${KIND_PROVIDER}" ${KIND} create cluster \
             --name "${CLUSTER_NAME}" \
-            --config "${SCRIPT_DIR}/kind-config.yaml" \
+            --config "${KIND_CONFIG}" \
             --wait 60s
     fi
 }

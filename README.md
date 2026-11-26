@@ -44,6 +44,29 @@ make lint              # golangci-lint
 make verify            # fail if generated or derived output is uncommitted
 ```
 
+The e2e suite runs a real Proxy and checks initial HTTP traffic, filter reload
+without pod replacement or container restart, and a listener-port rollout. It uses
+the Kubernetes API Service proxy to reach the workload, so it does not test
+ClusterIP routing through kube-proxy on the default cluster. The IPv6-primary
+spec drives ClusterIP traffic with a pinned client image; create the dual-stack
+cluster it needs with `make kind-up-ipv6`, which makes Services default to IPv6,
+then run `make test-e2e`.
+
+To run locally with Docker:
+
+```console
+make kind-up CONTAINER_ENGINE=docker
+kubectl config use-context kind-gateway-controller-dev
+make test-e2e
+```
+
+`make test-e2e` supplies the digest-pinned Linux/amd64 Praxis image defined in the
+Makefile. ARM hosts need emulation support or a native image override.
+For a local runtime build, load the image into the kind cluster and pass its image
+reference as `PRAXIS_E2E_IMAGE` to Make. Direct Ginkgo or `go test` invocations must
+set that environment variable explicitly. The test allows up to four minutes for
+ConfigMap projection and reload, and fails if prerequisites are unavailable.
+
 Development follows the praxis-proxy [development conventions].
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup and pull request requirements.
