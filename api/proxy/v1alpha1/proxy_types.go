@@ -132,9 +132,12 @@ type PraxisListener struct {
 	Port int32 `json:"port"`
 
 	// bindAddress is the IP the listener binds to in the native config.
-	// Defaults to "0.0.0.0".
+	// Defaults to "0.0.0.0". Must be an IPv4 or IPv6 address literal; a
+	// hostname cannot be resolved at render time and the Service family
+	// selection could not account for it.
 	// +optional
 	// +kubebuilder:default="0.0.0.0"
+	// +kubebuilder:validation:Pattern="^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])([.](25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}|([0-9A-Fa-f]{1,4}:){7}[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,7}:|([0-9A-Fa-f]{1,4}:){1,6}:[0-9A-Fa-f]{1,4}|([0-9A-Fa-f]{1,4}:){1,5}(:[0-9A-Fa-f]{1,4}){1,2}|([0-9A-Fa-f]{1,4}:){1,4}(:[0-9A-Fa-f]{1,4}){1,3}|([0-9A-Fa-f]{1,4}:){1,3}(:[0-9A-Fa-f]{1,4}){1,4}|([0-9A-Fa-f]{1,4}:){1,2}(:[0-9A-Fa-f]{1,4}){1,5}|[0-9A-Fa-f]{1,4}:((:[0-9A-Fa-f]{1,4}){1,6})|:((:[0-9A-Fa-f]{1,4}){1,7}|:))$"
 	BindAddress *string `json:"bindAddress,omitempty"`
 
 	// tls configures downstream TLS material.
