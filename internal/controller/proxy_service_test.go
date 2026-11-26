@@ -47,13 +47,25 @@ func TestServiceIPFamilies(t *testing.T) {
 			wantPolicy: corev1.IPFamilyPolicySingleStack,
 		},
 		{
-			name:       "dual-stack wildcard accepts both families",
+			name:       "dual-stack wildcard lets the cluster choose families",
 			binds:      []*string{bind("::")},
-			wantFamily: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
+			wantFamily: nil,
 			wantPolicy: corev1.IPFamilyPolicyPreferDualStack,
 		},
 		{
-			name:       "mixed binds request both families",
+			name:       "dual-stack wildcard next to an IPv4 bind stays IPv4",
+			binds:      []*string{bind("::"), bind("0.0.0.0")},
+			wantFamily: []corev1.IPFamily{corev1.IPv4Protocol},
+			wantPolicy: corev1.IPFamilyPolicySingleStack,
+		},
+		{
+			name:       "dual-stack wildcard next to an IPv6 bind stays IPv6",
+			binds:      []*string{bind("::"), bind("fd00::1")},
+			wantFamily: []corev1.IPFamily{corev1.IPv6Protocol},
+			wantPolicy: corev1.IPFamilyPolicySingleStack,
+		},
+		{
+			name:       "mixed single-family binds request both families",
 			binds:      []*string{bind("0.0.0.0"), bind("fd00::1")},
 			wantFamily: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
 			wantPolicy: corev1.IPFamilyPolicyPreferDualStack,
@@ -96,13 +108,31 @@ func TestReconcileService_IPFamilies(t *testing.T) {
 	t.Parallel()
 
 	v6Bind := "fd00::1"
+	wildcardBind := "::"
 	tests := []struct {
 		name       string
 		bind       *string
-		wantFamily corev1.IPFamily
+		wantFamily []corev1.IPFamily
+		wantPolicy corev1.IPFamilyPolicy
 	}{
-		{name: "default bind publishes an IPv4 Service", bind: nil, wantFamily: corev1.IPv4Protocol},
-		{name: "IPv6 bind publishes an IPv6 Service", bind: &v6Bind, wantFamily: corev1.IPv6Protocol},
+		{
+			name:       "default bind publishes an IPv4 Service",
+			bind:       nil,
+			wantFamily: []corev1.IPFamily{corev1.IPv4Protocol},
+			wantPolicy: corev1.IPFamilyPolicySingleStack,
+		},
+		{
+			name:       "IPv6 bind publishes an IPv6 Service",
+			bind:       &v6Bind,
+			wantFamily: []corev1.IPFamily{corev1.IPv6Protocol},
+			wantPolicy: corev1.IPFamilyPolicySingleStack,
+		},
+		{
+			name:       "dual-stack wildcard leaves the families for the cluster to choose",
+			bind:       &wildcardBind,
+			wantFamily: nil,
+			wantPolicy: corev1.IPFamilyPolicyPreferDualStack,
+		},
 	}
 
 	for _, tt := range tests {
@@ -123,11 +153,16 @@ func TestReconcileService_IPFamilies(t *testing.T) {
 			if err := cl.Get(context.Background(), types.NamespacedName{Namespace: "default", Name: "gw"}, svc); err != nil {
 				t.Fatalf("fetch service: %v", err)
 			}
-			if len(svc.Spec.IPFamilies) != 1 || svc.Spec.IPFamilies[0] != tt.wantFamily {
-				t.Errorf("ipFamilies = %v, want [%s]", svc.Spec.IPFamilies, tt.wantFamily)
+			if len(svc.Spec.IPFamilies) != len(tt.wantFamily) {
+				t.Errorf("ipFamilies = %v, want %v", svc.Spec.IPFamilies, tt.wantFamily)
 			}
-			if svc.Spec.IPFamilyPolicy == nil || *svc.Spec.IPFamilyPolicy != corev1.IPFamilyPolicySingleStack {
-				t.Errorf("ipFamilyPolicy = %v, want SingleStack", svc.Spec.IPFamilyPolicy)
+			for i := range tt.wantFamily {
+				if svc.Spec.IPFamilies[i] != tt.wantFamily[i] {
+					t.Errorf("ipFamilies = %v, want %v", svc.Spec.IPFamilies, tt.wantFamily)
+				}
+			}
+			if svc.Spec.IPFamilyPolicy == nil || *svc.Spec.IPFamilyPolicy != tt.wantPolicy {
+				t.Errorf("ipFamilyPolicy = %v, want %s", svc.Spec.IPFamilyPolicy, tt.wantPolicy)
 			}
 		})
 	}

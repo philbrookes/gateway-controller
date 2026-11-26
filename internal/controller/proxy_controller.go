@@ -392,8 +392,13 @@ func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1al
 		desired.Spec.Type = serviceType(proxy)
 		desired.Spec.Ports = buildServicePorts(proxy)
 		families, familyPolicy := serviceIPFamilies(proxy)
-		desired.Spec.IPFamilies = families
 		desired.Spec.IPFamilyPolicy = &familyPolicy
+		// A nil family list asks the API server to allocate what the
+		// cluster supports, so the field stays unset on create and is
+		// never rewritten on update, where the families are immutable.
+		if families != nil {
+			desired.Spec.IPFamilies = families
+		}
 		return nil
 	})
 	return err
@@ -408,27 +413,41 @@ func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1al
 // (and the renderer's default bind) is the IPv4 wildcard, which never
 // accepts a connection to an IPv6 address, while the IPv6 wildcard ::
 // accepts both families. The Service therefore follows the listeners.
-// IPv4-only binds keep the IPv4 family — today's behavior on IPv4
-// clusters, and a compatible choice on dual-stack clusters whose primary
-// family is IPv6, where a defaulted Service would be IPv6 and its
-// traffic unreachable for the default binds. Explicit IPv6 binds move
-// the Service to IPv6, and a mix — or a dual-stack wildcard — asks for
-// both families, which single-family clusters trim at admission.
-// Clusters without any requested family reject the Service instead of
-// publishing an unreachable one.
+// IPv4-only and IPv6-only binds keep their family explicitly — today's
+// behavior on IPv4 clusters, and a compatible choice on dual-stack
+// clusters whose primary family is IPv6, where a defaulted Service would
+// be unreachable for the default binds.
+//
+// Listeners that each accept both families (the IPv6 wildcard) are
+// unconstrained: the Service requests PreferDualStack and leaves the
+// families unset, so the API server allocates what the cluster supports —
+// both on dual-stack clusters, the one available family on single-family
+// clusters, instead of rejecting the Service for requesting a family the
+// cluster cannot allocate.
+//
+// A mix of IPv4-only and IPv6-only listeners leaves no single family that
+// serves every listener, so the Service must carry both and requests them
+// explicitly; single-family clusters reject it rather than publish a
+// Service half the listeners cannot accept. A proxy without listeners
+// keeps the explicit IPv4 default the controller has always published.
 func serviceIPFamilies(proxy *proxyv1alpha1.Proxy) ([]corev1.IPFamily, corev1.IPFamilyPolicy) {
-	v4, v6 := false, false
+	if len(proxy.Spec.Listeners) == 0 {
+		return []corev1.IPFamily{corev1.IPv4Protocol}, corev1.IPFamilyPolicySingleStack
+	}
+	onlyV4, onlyV6 := false, false
 	for i := range proxy.Spec.Listeners {
-		l4, l6 := listenerBindFamilies(proxy.Spec.Listeners[i].BindAddress)
-		v4, v6 = v4 || l4, v6 || l6
+		v4, v6 := listenerBindFamilies(proxy.Spec.Listeners[i].BindAddress)
+		onlyV4, onlyV6 = onlyV4 || (v4 && !v6), onlyV6 || (v6 && !v4)
 	}
 	switch {
-	case v4 && v6:
+	case onlyV4 && onlyV6:
 		return []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol}, corev1.IPFamilyPolicyPreferDualStack
-	case v6:
+	case onlyV6:
 		return []corev1.IPFamily{corev1.IPv6Protocol}, corev1.IPFamilyPolicySingleStack
-	default:
+	case onlyV4:
 		return []corev1.IPFamily{corev1.IPv4Protocol}, corev1.IPFamilyPolicySingleStack
+	default:
+		return nil, corev1.IPFamilyPolicyPreferDualStack
 	}
 }
 

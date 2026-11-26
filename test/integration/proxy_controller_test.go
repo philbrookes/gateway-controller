@@ -550,6 +550,24 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("should create a Service for IPv6-wildcard binds on a single-family cluster", func(ctx context.Context) {
+		proxy := validProxy("svc-wildcard")
+		wildcard := "::"
+		proxy.Spec.Listeners[0].BindAddress = &wildcard
+		createProxy(ctx, proxy)
+
+		// The API server here allocates a single family, so the Service
+		// can only exist if the controller left the families for the API
+		// server to choose instead of requesting both explicitly.
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.IPFamilies).To(Equal([]corev1.IPFamily{corev1.IPv4Protocol}))
+			gom.Expect(svc.Spec.IPFamilyPolicy).NotTo(BeNil())
+			gom.Expect(*svc.Spec.IPFamilyPolicy).To(Equal(corev1.IPFamilyPolicyPreferDualStack))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should set Ready=False when deployment has no ready replicas", func(ctx context.Context) {
 		proxy := validProxy("ready-false")
 		createProxy(ctx, proxy)
@@ -636,6 +654,37 @@ var _ = Describe("Proxy Controller", func() {
 			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
 			gom.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
 			gom.Expect(got.Status.PublishedRevision).To(Equal(originalRevision))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("keeps the Service families when a bind changes to the IPv6 wildcard", func(ctx context.Context) {
+		proxy := validProxy("svc-wildcard-update")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.IPFamilies).To(Equal([]corev1.IPFamily{corev1.IPv4Protocol}))
+			// Refresh the proxy so the update below is not rejected as
+			// a conflict against the reconciler's status writes.
+			cond := acceptedCondition(ctx, proxy)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		wildcard := "::"
+		proxy.Spec.Listeners[0].BindAddress = &wildcard
+		Expect(k8sClient.Update(ctx, proxy)).To(Succeed())
+
+		// The families are immutable once allocated, so the reconcile
+		// must leave them alone rather than fail trying to clear them;
+		// only the policy follows the wildcard bind.
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.IPFamilies).To(Equal([]corev1.IPFamily{corev1.IPv4Protocol}))
+			gom.Expect(svc.Spec.IPFamilyPolicy).NotTo(BeNil())
+			gom.Expect(*svc.Spec.IPFamilyPolicy).To(Equal(corev1.IPFamilyPolicyPreferDualStack))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
