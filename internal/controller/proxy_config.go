@@ -17,14 +17,175 @@ import (
 
 const (
 	configVolumeName   = "praxis-config"
-	configMountPath    = "/etc/praxis"
+	configMountPath    = "/etc/praxis/config"
 	configFileName     = "config.yaml"
-	configSubPath      = configFileName
 	defaultBindAddress = "0.0.0.0"
 	policyFilterType   = "policy"
 	policyMountPath    = "/etc/praxis/policies"
 	tlsMountPrefix     = "/etc/praxis/tls"
 )
+
+const (
+	readinessListenerBase = "readiness"
+	defaultReadinessPort  = 19902
+	// readinessFilterType is the single filter of the readiness
+	// listener's health-only chain. The Praxis configuration reference
+	// documents static_response for exactly this use — "useful for
+	// health checks" — answering with a fixed response without
+	// contacting any upstream, so the chain cannot route application
+	// traffic.
+	readinessFilterType = "static_response"
+	// readinessResponseStatus is the fixed status the health-only chain
+	// answers with.
+	readinessResponseStatus = 200
+	// dualStackWildcard is the address the controller-rendered readiness
+	// listener binds: the IPv6 wildcard, the only listener address that
+	// accepts connections on the pod IP's family whichever it is — Linux
+	// dual-stack sockets accept IPv4 connections on it via IPv4-mapped
+	// addresses. Detecting the family instead is not possible in this
+	// renderer: the config is rendered from the spec before any pod
+	// exists, and the spec's binds do not determine the pod network —
+	// listeners bound only to loopback or to 0.0.0.0 (the API default)
+	// leave the family unknown, and an IPv4 wildcard would never answer
+	// the kubelet's dial to an IPv6 pod IP. A netns with IPv6 disabled
+	// cannot bind this address, but such clusters are IPv4-only by
+	// construction.
+	dualStackWildcard = "::"
+)
+
+// podIPBind reports whether a listener bound to bindAddress accepts
+// connections on the pod IP the kubelet dials, whichever family that IP
+// has. Only the IPv6 wildcard does: it accepts IPv6 dials, and IPv4 dials
+// via IPv4-mapped addresses. A nil bind renders as the IPv4 wildcard —
+// as does the API-defaulted "0.0.0.0" — which never answers a dial to an
+// IPv6 pod IP.
+func podIPBind(bindAddress *string) bool {
+	if bindAddress == nil {
+		return false
+	}
+	ip := net.ParseIP(*bindAddress)
+	return ip != nil && ip.To4() == nil && ip.IsUnspecified()
+}
+
+// podIPListener returns the first spec listener the readiness probe can
+// reach through the pod IP, or nil when none can: only a listener bound
+// to the dual-stack IPv6 wildcard accepts the kubelet's dial on either
+// pod IP family.
+func podIPListener(spec *proxyv1alpha1.ProxySpec) *proxyv1alpha1.PraxisListener {
+	for i := range spec.Listeners {
+		if podIPBind(spec.Listeners[i].BindAddress) {
+			return &spec.Listeners[i]
+		}
+	}
+	return nil
+}
+
+// readinessListenerName returns the name of the controller-rendered
+// readiness listener, avoiding the spec listener names so the rendered
+// config keeps unique listener names.
+func readinessListenerName(spec *proxyv1alpha1.ProxySpec) string {
+	taken := make(map[string]bool, len(spec.Listeners))
+	for _, listener := range spec.Listeners {
+		taken[listener.Name] = true
+	}
+	return uniqueName(readinessListenerBase, taken)
+}
+
+// readinessChainName returns the name of the readiness listener's
+// health-only filter chain, avoiding the spec chain names so the chain
+// reference resolves to the controller-rendered chain alone.
+func readinessChainName(spec *proxyv1alpha1.ProxySpec) string {
+	taken := make(map[string]bool, len(spec.FilterChains))
+	for _, chain := range spec.FilterChains {
+		taken[chain.Name] = true
+	}
+	return uniqueName(readinessListenerBase, taken)
+}
+
+// uniqueName returns base, or base-<n> for the smallest suffix not
+// already taken.
+func uniqueName(base string, taken map[string]bool) string {
+	name := base
+	for suffix := 0; taken[name]; suffix++ {
+		name = fmt.Sprintf("%s-%d", base, suffix)
+	}
+	return name
+}
+
+// readinessPort returns the port of the controller-rendered readiness
+// listener: the default readiness port, or the next free port when a spec
+// listener or the admin interface already binds it.
+func readinessPort(spec *proxyv1alpha1.ProxySpec) int32 {
+	used := make(map[int32]bool, len(spec.Listeners))
+	for _, listener := range spec.Listeners {
+		used[listener.Port] = true
+	}
+	if spec.Admin != nil {
+		if _, port, err := net.SplitHostPort(spec.Admin.Address); err == nil {
+			if parsed, err := strconv.ParseInt(port, 10, 32); err == nil {
+				used[int32(parsed)] = true
+			}
+		}
+	}
+	port := int32(defaultReadinessPort)
+	for used[port] {
+		port++
+	}
+	return port
+}
+
+// renderListenerTLS returns the native TLS config for a listener's
+// certificate, which the controller's Deployment mounts under the
+// listener's TLS directory.
+func renderListenerTLS(listener *proxyv1alpha1.PraxisListener) *nativeTLS {
+	if listener.TLS == nil {
+		return nil
+	}
+	return &nativeTLS{
+		CertPath: fmt.Sprintf("%s/%s/tls.crt", tlsMountPrefix, listener.Name),
+		KeyPath:  fmt.Sprintf("%s/%s/tls.key", tlsMountPrefix, listener.Name),
+	}
+}
+
+// readinessFilterChain returns the health-only filter chain the
+// readiness listener executes. The Praxis validator rejects chainless
+// HTTP listeners — filter_chains may only be omitted on protocol: tcp
+// listeners, which must instead route via upstream or cluster — so the
+// readiness listener carries this dedicated chain. Its single
+// static_response filter is the form the Praxis configuration reference
+// documents for health checks: it answers with a fixed response without
+// contacting any upstream, so no application traffic can be routed
+// through it.
+func readinessFilterChain(spec *proxyv1alpha1.ProxySpec) nativeChain {
+	return nativeChain{
+		Name: readinessChainName(spec),
+		Filters: []map[string]any{{
+			"filter": readinessFilterType,
+			"status": readinessResponseStatus,
+		}},
+	}
+}
+
+// renderReadinessListener returns the listener the controller appends to
+// the rendered config when no spec listener is reachable through the pod
+// IP: a dual-stack wildcard-bound listener dedicated to the readiness
+// probe, executing only the health-only static_response chain. It
+// mirrors the first listener's TLS material — already mounted for that
+// listener — so a TLS-enabled proxy keeps no plaintext port. A TCP probe
+// still succeeds against a TLS listener, which accepts the connection
+// before any handshake.
+func renderReadinessListener(spec *proxyv1alpha1.ProxySpec) nativeListener {
+	var listenerTLS *nativeTLS
+	if len(spec.Listeners) > 0 {
+		listenerTLS = renderListenerTLS(&spec.Listeners[0])
+	}
+	return nativeListener{
+		Name:         readinessListenerName(spec),
+		Address:      net.JoinHostPort(dualStackWildcard, strconv.FormatInt(int64(readinessPort(spec)), 10)),
+		FilterChains: []string{readinessChainName(spec)},
+		TLS:          listenerTLS,
+	}
+}
 
 type nativeConfig struct {
 	Admin           *nativeAdmin     `json:"admin,omitempty"`
@@ -100,14 +261,20 @@ func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1a
 			Name:         listener.Name,
 			Address:      net.JoinHostPort(bindAddr, strconv.FormatInt(int64(listener.Port), 10)),
 			FilterChains: listener.FilterChains,
-		}
-		if listener.TLS != nil {
-			native.TLS = &nativeTLS{
-				CertPath: fmt.Sprintf("%s/%s/tls.crt", tlsMountPrefix, listener.Name),
-				KeyPath:  fmt.Sprintf("%s/%s/tls.key", tlsMountPrefix, listener.Name),
-			}
+			TLS:          renderListenerTLS(&listener),
 		}
 		cfg.Listeners = append(cfg.Listeners, native)
+	}
+
+	// No spec listener accepts connections on the pod IP — every
+	// listener binds a specific address or the IPv4-only wildcard — so
+	// the readiness probe needs the dedicated dual-stack listener to
+	// target. It executes only the health-only static_response chain, so
+	// it accepts connections purely for the probe and cannot route
+	// application traffic.
+	renderReadiness := podIPListener(spec) == nil
+	if renderReadiness {
+		cfg.Listeners = append(cfg.Listeners, renderReadinessListener(spec))
 	}
 
 	if len(spec.FilterChains) > 0 {
@@ -127,6 +294,12 @@ func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1a
 			}
 			cfg.FilterChains = append(cfg.FilterChains, nc)
 		}
+	}
+
+	// The readiness listener's chain is rendered next to the spec chains
+	// so its named reference resolves.
+	if renderReadiness {
+		cfg.FilterChains = append(cfg.FilterChains, readinessFilterChain(spec))
 	}
 
 	out, err := yaml.Marshal(cfg)
@@ -347,4 +520,11 @@ func renderResponseMatch(match *proxyv1alpha1.PraxisResponseMatch) map[string]an
 		out["headers_present"] = match.HeadersPresent
 	}
 	return out
+}
+
+// computeStartupRevision hashes the settings that require a Praxis restart.
+// Filter contents reload from the live ConfigMap; scaling and Service settings
+// do not affect the running process configuration.
+func computeStartupRevision(spec *proxyv1alpha1.ProxySpec) (string, error) {
+	return computeRevision(spec.Listeners, spec.Admin, spec.InsecureOptions, spec.Image, spec.SecretEnv)
 }

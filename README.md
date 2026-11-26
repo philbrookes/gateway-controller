@@ -2,6 +2,14 @@
 
 This controller will manage the Kubernetes based control plane API for Gateway implementations such as AI Gateway.
 
+## Proxy configuration updates
+
+Filter-chain changes update the mounted ConfigMap for Praxis to reload without
+restarting pods. ConfigMap projection is asynchronous, so updates are not immediate.
+Listener, admin, and insecure-option changes trigger a rollout. Replica changes
+scale the Deployment without restarting existing pods. To roll back configuration,
+restore the Proxy spec; a Deployment rollback leaves the live ConfigMap unchanged.
+
 ## Policy filter references
 
 Policy filter references render to the native policy filter: the controller

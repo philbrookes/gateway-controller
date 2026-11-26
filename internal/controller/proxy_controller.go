@@ -4,17 +4,24 @@ import (
 	"context"
 	"fmt"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
+)
+
+const (
+	containerName                 = "praxis"
+	defaultTerminationGracePeriod = int64(30)
 )
 
 type ProxyReconciler struct {
@@ -27,6 +34,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=praxis.io,resources=policies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -74,6 +82,14 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	if err := r.reconcileConfigMap(ctx, &proxy, configData); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile configmap: %w", err)
+	}
+
+	startupRevision, err := computeStartupRevision(&proxy.Spec)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileDeployment(ctx, &proxy, startupRevision); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile deployment: %w", err)
 	}
 
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
@@ -135,9 +151,202 @@ func (r *ProxyReconciler) reconcileConfigMap(ctx context.Context, proxy *proxyv1
 	})
 	return err
 }
+
+// startupRevisionAnnotation changes only for settings that Praxis cannot reload.
+const startupRevisionAnnotation = "praxis.io/startup-revision"
+
+func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv1alpha1.Proxy, revision string) error {
+	desired := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxy.Name,
+			Namespace: proxy.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
+		if err := ensureControlledBy(desired, proxy, schema.GroupResource{Group: "apps", Resource: "deployments"}); err != nil {
+			return err
+		}
+		if err := controllerutil.SetControllerReference(proxy, desired, r.Scheme); err != nil {
+			return err
+		}
+		replicas := int32(1)
+		if proxy.Spec.Replicas != nil {
+			replicas = *proxy.Spec.Replicas
+		}
+		desired.Spec.Replicas = &replicas
+		desired.Spec.Selector = &metav1.LabelSelector{
+			MatchLabels: proxyLabels(proxy),
+		}
+		desired.Spec.Template = buildPodTemplate(proxy, revision)
+		return nil
+	})
+	return err
+}
+func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
+	instance := proxy.Name
+	if len(instance) > maxLabelValueLen {
+		instance = instance[:maxLabelValueLen]
+	}
+	return map[string]string{
+		"app.kubernetes.io/name":       containerName,
+		"app.kubernetes.io/instance":   instance,
+		"app.kubernetes.io/managed-by": "gateway-controller",
+	}
+}
+func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTemplateSpec {
+	volumes, mounts := buildVolumes(proxy)
+	gracePeriod := defaultTerminationGracePeriod
+	container := corev1.Container{
+		Name:                     containerName,
+		Image:                    proxy.Spec.Image,
+		Command:                  []string{containerName},
+		Args:                     []string{"--config", configMountPath + "/" + configFileName},
+		Ports:                    buildContainerPorts(proxy),
+		VolumeMounts:             mounts,
+		Env:                      buildEnvVars(proxy),
+		ReadinessProbe:           buildReadinessProbe(proxy),
+		ImagePullPolicy:          corev1.PullIfNotPresent,
+		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
+		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
+	}
+	return corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{
+			Labels: proxyLabels(proxy),
+			Annotations: map[string]string{
+				startupRevisionAnnotation: revision,
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers:                    []corev1.Container{container},
+			Volumes:                       volumes,
+			RestartPolicy:                 corev1.RestartPolicyAlways,
+			DNSPolicy:                     corev1.DNSClusterFirst,
+			TerminationGracePeriodSeconds: &gracePeriod,
+			SchedulerName:                 corev1.DefaultSchedulerName,
+		},
+	}
+}
+func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeMount) {
+	volumes := []corev1.Volume{{
+		Name: configVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: configMapName(proxy)},
+			},
+		},
+	}}
+	mounts := []corev1.VolumeMount{{
+		Name:      configVolumeName,
+		MountPath: configMountPath,
+		ReadOnly:  true,
+	}}
+
+	for _, listener := range proxy.Spec.Listeners {
+		if listener.TLS == nil {
+			continue
+		}
+		volName := "tls-" + listener.Name
+		volumes = append(volumes, corev1.Volume{
+			Name: volName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: listener.TLS.CertificateRef.Name,
+				},
+			},
+		})
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      volName,
+			MountPath: fmt.Sprintf("%s/%s", tlsMountPrefix, listener.Name),
+			ReadOnly:  true,
+		})
+	}
+	return volumes, mounts
+}
+
+// buildReadinessProbe gates pod readiness on Praxis actually serving.
+// The runtime has no dedicated health endpoint, so the probe is a TCP
+// connect against a listener the kubelet can reach through the pod IP
+// (it dials the pod IP from the node): the first listener bound to the
+// dual-stack IPv6 wildcard, the only bind that answers the dial on
+// either pod IP family. Listeners bound to the IPv4 wildcard (the
+// default bind) or to specific addresses such as loopback cannot be
+// reached through an IPv6 pod IP, so the controller renders a dedicated
+// dual-stack readiness listener into the config and the probe targets
+// that instead. The port is referenced by name in both cases, so the
+// wiring survives port renumbering; a replacement pod therefore stays
+// unready during startup until Praxis has bound the listener and can
+// accept traffic.
+func buildReadinessProbe(proxy *proxyv1alpha1.Proxy) *corev1.Probe {
+	if len(proxy.Spec.Listeners) == 0 {
+		return nil
+	}
+	portName := readinessListenerName(&proxy.Spec)
+	if reachable := podIPListener(&proxy.Spec); reachable != nil {
+		portName = reachable.Name
+	}
+	const (
+		initialDelaySeconds = 5
+		periodSeconds       = 5
+		timeoutSeconds      = 2
+		successThreshold    = 1
+		failureThreshold    = 3
+	)
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromString(portName),
+			},
+		},
+		InitialDelaySeconds: initialDelaySeconds,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      timeoutSeconds,
+		SuccessThreshold:    successThreshold,
+		FailureThreshold:    failureThreshold,
+	}
+}
+func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
+	ports := make([]corev1.ContainerPort, 0, len(proxy.Spec.Listeners))
+	for _, listener := range proxy.Spec.Listeners {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          listener.Name,
+			ContainerPort: listener.Port,
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+	// The readiness probe targets the controller-rendered readiness
+	// listener when no spec listener is reachable through the pod IP;
+	// declare its port so the probe's named reference resolves.
+	if podIPListener(&proxy.Spec) == nil {
+		ports = append(ports, corev1.ContainerPort{
+			Name:          readinessListenerName(&proxy.Spec),
+			ContainerPort: readinessPort(&proxy.Spec),
+			Protocol:      corev1.ProtocolTCP,
+		})
+	}
+	return ports
+}
+func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
+	if len(proxy.Spec.SecretEnv) == 0 {
+		return nil
+	}
+	envVars := make([]corev1.EnvVar, 0, len(proxy.Spec.SecretEnv))
+	for _, secretEnv := range proxy.Spec.SecretEnv {
+		envVars = append(envVars, corev1.EnvVar{
+			Name: secretEnv.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: secretEnv.SecretRef.Name},
+					Key:                  secretEnv.SecretRef.Key,
+				},
+			},
+		})
+	}
+	return envVars
+}
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.Proxy{}).
 		Owns(&corev1.ConfigMap{}).
+		Owns(&appsv1.Deployment{}).
 		Complete(r)
 }

@@ -88,6 +88,30 @@ func unownedConfigMap() *corev1.ConfigMap {
 	}
 }
 
+func unownedDeployment() *appsv1.Deployment {
+	replicas := int32(7)
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw",
+			Namespace:         "default",
+			UID:               "deploy-uid",
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Template: podTemplateWithImage("user-image:custom"),
+		},
+	}
+}
+
+func podTemplateWithImage(image string) corev1.PodTemplateSpec {
+	return corev1.PodTemplateSpec{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "user", Image: image}},
+		},
+	}
+}
+
 // TestReconcileResources_RefuseUnownedObjects verifies that the reconciler
 // never adopts or overwrites existing objects it does not control: an
 // object with no controller owner, or one controlled by another
@@ -138,6 +162,41 @@ func TestReconcileResources_RefuseUnownedObjects(t *testing.T) {
 					t.Errorf("foreign-owned ConfigMap was overwritten: %q", cm.Data[configFileName])
 				}
 				if owner := metav1.GetControllerOf(cm); owner == nil || owner.UID != "foreign-uid" {
+					t.Errorf("foreign controller owner was replaced: %+v", owner)
+				}
+			},
+		},
+		{
+			name:      "deployment without controller owner",
+			existing:  unownedDeployment(),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			check: func(t *testing.T, got client.Object) {
+				deploy := got.(*appsv1.Deployment)
+				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Image != "user-image:custom" {
+					t.Errorf("unowned Deployment was overwritten: %+v", deploy.Spec.Template.Spec.Containers)
+				}
+				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 7 {
+					t.Errorf("unowned Deployment replicas were changed: %v", deploy.Spec.Replicas)
+				}
+				if owner := metav1.GetControllerOf(deploy); owner != nil {
+					t.Errorf("unowned Deployment was adopted by %q", owner.Name)
+				}
+			},
+		},
+		{
+			name:      "deployment controlled by another controller",
+			existing:  withForeignOwner(unownedDeployment()),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			check: func(t *testing.T, got client.Object) {
+				deploy := got.(*appsv1.Deployment)
+				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Image != "user-image:custom" {
+					t.Errorf("foreign-owned Deployment was overwritten: %+v", deploy.Spec.Template.Spec.Containers)
+				}
+				if owner := metav1.GetControllerOf(deploy); owner == nil || owner.UID != "foreign-uid" {
 					t.Errorf("foreign controller owner was replaced: %+v", owner)
 				}
 			},
@@ -220,6 +279,39 @@ func TestReconcileResources_MutateOwnedAndCreateObjects(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:      "deployment absent is created",
+			existing:  nil,
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			check: func(t *testing.T, got client.Object) {
+				deploy := got.(*appsv1.Deployment)
+				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Name != containerName {
+					t.Errorf("praxis container missing: %+v", deploy.Spec.Template.Spec.Containers)
+				}
+				assertLiveConfigMount(t, deploy)
+				if owner := metav1.GetControllerOf(deploy); owner == nil || owner.UID != proxy.UID {
+					t.Errorf("controller owner: %+v", owner)
+				}
+			},
+		},
+		{
+			name:      "deployment owned by proxy is updated",
+			existing:  withControllerOwner(unownedDeployment(), proxy),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			check: func(t *testing.T, got client.Object) {
+				deploy := got.(*appsv1.Deployment)
+				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Name != containerName {
+					t.Errorf("praxis container missing: %+v", deploy.Spec.Template.Spec.Containers)
+				}
+				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 1 {
+					t.Errorf("replicas: %v", deploy.Spec.Replicas)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -264,6 +356,126 @@ func fetchConfigMap(t *testing.T, cl client.Client, name string) *corev1.ConfigM
 	return cm
 }
 
+// TestBuildPodTemplate_ReadinessProbe verifies the generated container
+// carries a readiness probe wired to a listener the kubelet can reach
+// through the pod IP. The Praxis runtime has no dedicated health
+// endpoint, so a TCP probe on a bound, pod-IP-reachable listener is the
+// readiness signal: a replacement pod remains unready during startup
+// until Praxis has bound the listener and can accept traffic.
+func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
+	t.Parallel()
+
+	t.Run("probes the first listener port by name", func(t *testing.T) {
+		t.Parallel()
+		proxy := guardTestProxy()
+		// Bound to the dual-stack wildcard so the probe can target it
+		// directly; the default bind renders the IPv4 wildcard, which is
+		// not reachable through an IPv6 pod IP.
+		dualStack := "::"
+		proxy.Spec.Listeners[0].BindAddress = &dualStack
+		template := buildPodTemplate(proxy, "rev")
+		containers := template.Spec.Containers
+		if len(containers) != 1 {
+			t.Fatalf("containers: %d", len(containers))
+		}
+		probe := containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil {
+			t.Fatalf("readiness probe must be a TCP probe, got: %+v", probe)
+		}
+		if got := probe.TCPSocket.Port.StrVal; got != "http" {
+			t.Errorf("probe port %q must reference the first listener's named port", got)
+		}
+	})
+
+	t.Run("keeps targeting the first listener with several listeners", func(t *testing.T) {
+		t.Parallel()
+		proxy := guardTestProxy()
+		dualStack := "::"
+		proxy.Spec.Listeners[0].BindAddress = &dualStack
+		proxy.Spec.Listeners = append(proxy.Spec.Listeners, proxyv1alpha1.PraxisListener{
+			Name:         "health",
+			Port:         8081,
+			FilterChains: []string{"main"},
+		})
+		probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "http" {
+			t.Fatalf("probe must target the first listener, got: %+v", probe)
+		}
+	})
+
+	t.Run("omits the probe without listeners", func(t *testing.T) {
+		t.Parallel()
+		proxy := guardTestProxy()
+		proxy.Spec.Listeners = nil
+		if probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe; probe != nil {
+			t.Errorf("expected no readiness probe without listeners, got: %+v", probe)
+		}
+	})
+
+	t.Run("probes the first listener bound to the dual-stack wildcard", func(t *testing.T) {
+		t.Parallel()
+		loopback := "127.0.0.1"
+		dualStack := "::"
+		proxy := guardTestProxy()
+		proxy.Spec.Listeners[0].BindAddress = &loopback
+		proxy.Spec.Listeners = append(proxy.Spec.Listeners, proxyv1alpha1.PraxisListener{
+			Name:         "public",
+			Port:         8081,
+			BindAddress:  &dualStack,
+			FilterChains: []string{"main"},
+		})
+		probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "public" {
+			t.Fatalf("probe must target the first pod-IP-reachable listener, got: %+v", probe)
+		}
+	})
+
+	t.Run("targets the dedicated readiness listener for IPv4-wildcard binds", func(t *testing.T) {
+		t.Parallel()
+		// The IPv4 wildcard is the API default; it never answers the
+		// kubelet's dial to an IPv6 pod IP, so the probe must target the
+		// controller's dedicated dual-stack listener instead.
+		ipv4Wildcard := "0.0.0.0"
+		proxy := guardTestProxy()
+		proxy.Spec.Listeners[0].BindAddress = &ipv4Wildcard
+		template := buildPodTemplate(proxy, "rev")
+		probe := template.Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "readiness" {
+			t.Fatalf("probe must target the dedicated readiness listener, got: %+v", probe)
+		}
+		var readinessPort int32
+		for _, port := range template.Spec.Containers[0].Ports {
+			if port.Name == "readiness" {
+				readinessPort = port.ContainerPort
+			}
+		}
+		if readinessPort != 19902 {
+			t.Errorf("container must declare the readiness port 19902, got: %d", readinessPort)
+		}
+	})
+
+	t.Run("targets the dedicated readiness listener without a reachable listener", func(t *testing.T) {
+		t.Parallel()
+		loopback := "127.0.0.1"
+		proxy := guardTestProxy()
+		proxy.Spec.Listeners[0].BindAddress = &loopback
+		template := buildPodTemplate(proxy, "rev")
+		probe := template.Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "readiness" {
+			t.Fatalf("probe must target the dedicated readiness listener, got: %+v", probe)
+		}
+		var readinessPort int32
+		for _, port := range template.Spec.Containers[0].Ports {
+			if port.Name == "readiness" {
+				readinessPort = port.ContainerPort
+			}
+		}
+		if readinessPort != 19902 {
+			t.Errorf("container must declare the readiness port 19902, got: %d", readinessPort)
+		}
+	})
+}
+
 func TestReconcileConfigMap_LiveUpdates(t *testing.T) {
 	t.Parallel()
 	proxy := guardTestProxy()
@@ -289,5 +501,20 @@ func TestReconcileConfigMap_LiveUpdates(t *testing.T) {
 	}
 	if len(maps.Items) != 1 {
 		t.Errorf("live publication created %d ConfigMaps, want 1", len(maps.Items))
+	}
+}
+
+func assertLiveConfigMount(t *testing.T, deploy *appsv1.Deployment) {
+	t.Helper()
+	mounts := deploy.Spec.Template.Spec.Containers[0].VolumeMounts
+	if len(mounts) != 1 {
+		t.Fatalf("config volume mounts = %d, want 1", len(mounts))
+	}
+	if mounts[0].SubPath != "" || mounts[0].MountPath != configMountPath {
+		t.Errorf("config volume must mount the live directory, got %+v", mounts[0])
+	}
+	volumes := deploy.Spec.Template.Spec.Volumes
+	if len(volumes) != 1 || volumes[0].ConfigMap == nil || volumes[0].ConfigMap.Name != "gw-config" {
+		t.Errorf("config volume must reference the live ConfigMap, got %+v", volumes)
 	}
 }

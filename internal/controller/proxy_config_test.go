@@ -40,11 +40,17 @@ func TestRenderProxyConfig_Minimal(t *testing.T) {
 	if err := yaml.Unmarshal([]byte(got.Config), &parsed); err != nil {
 		t.Fatalf("invalid YAML: %v", err)
 	}
-	if len(parsed.Listeners) != 1 {
-		t.Fatalf("expected 1 listener, got %d", len(parsed.Listeners))
+	// The default bind renders the IPv4 wildcard, which never answers the
+	// kubelet's dial to an IPv6 pod IP, so the controller appends the
+	// dual-stack readiness listener next to it.
+	if len(parsed.Listeners) != 2 {
+		t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
 	}
 	if parsed.Listeners[0].Address != "0.0.0.0:8080" {
 		t.Errorf("expected address 0.0.0.0:8080, got %s", parsed.Listeners[0].Address)
+	}
+	if parsed.Listeners[1].Name != "readiness" || parsed.Listeners[1].Address != "[::]:19902" {
+		t.Errorf("expected the dual-stack readiness listener, got %+v", parsed.Listeners[1])
 	}
 }
 
@@ -310,6 +316,7 @@ func TestRenderProxyConfig_PolicyRef(t *testing.T) {
 		}
 	})
 }
+
 func TestRenderProxyConfig_PolicyFilterConfig(t *testing.T) {
 	t.Parallel()
 
@@ -427,6 +434,7 @@ func TestRenderProxyConfig_PolicyFilterConfig(t *testing.T) {
 		t.Errorf("policy filter config must be flat, found config wrapper: %v", filter["config"])
 	}
 }
+
 func TestRenderProxyConfig_PolicyDocumentCollection(t *testing.T) {
 	t.Parallel()
 	firstDocument := "kind: first"
@@ -483,6 +491,7 @@ func TestRenderProxyConfig_PolicyDocumentCollection(t *testing.T) {
 		}
 	}
 }
+
 func TestRenderProxyConfig_PolicyLookupError(t *testing.T) {
 	t.Parallel()
 	spec := &proxyv1alpha1.ProxySpec{
@@ -515,6 +524,7 @@ func TestRenderProxyConfig_PolicyLookupError(t *testing.T) {
 		t.Errorf("error should name the referencing filter entry: %v", err)
 	}
 }
+
 func TestRenderProxyConfig_Conditions(t *testing.T) {
 	t.Parallel()
 	apiPrefix := "/api"
@@ -665,5 +675,195 @@ func TestRenderProxyConfig_UnsupportedFilterRef(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "unsupported filter") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestRenderProxyConfig_ReadinessListener(t *testing.T) {
+	t.Parallel()
+
+	render := func(t *testing.T, spec *proxyv1alpha1.ProxySpec) nativeConfig {
+		t.Helper()
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var parsed nativeConfig
+		if err := yaml.Unmarshal([]byte(got.Config), &parsed); err != nil {
+			t.Fatalf("invalid YAML: %v", err)
+		}
+		return parsed
+	}
+
+	t.Run("renders no readiness listener for dual-stack-bound listeners", func(t *testing.T) {
+		t.Parallel()
+		// Only the IPv6 wildcard accepts the kubelet's dial on either
+		// pod IP family, so a listener bound to it is probed directly.
+		dualStack := "::"
+		parsed := render(t, readinessRenderSpec(&dualStack))
+		if len(parsed.Listeners) != 1 {
+			t.Fatalf("expected only the spec listener, got %d", len(parsed.Listeners))
+		}
+	})
+
+	t.Run("renders a dedicated readiness listener for IPv4-wildcard binds", func(t *testing.T) {
+		t.Parallel()
+		// The IPv4 wildcard is the API default and never answers a dial
+		// to an IPv6 pod IP, so it needs the dedicated listener.
+		ipv4Wildcard := "0.0.0.0"
+		parsed := render(t, readinessRenderSpec(&ipv4Wildcard))
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Name != "readiness" {
+			t.Errorf("readiness listener name: %q", readiness.Name)
+		}
+		if readiness.Address != "[::]:19902" {
+			t.Errorf("readiness listener must bind the dual-stack wildcard, got: %q", readiness.Address)
+		}
+		if len(readiness.FilterChains) != 1 || readiness.FilterChains[0] != "readiness" {
+			t.Errorf("readiness listener must reference its dedicated health-only chain, got: %v", readiness.FilterChains)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness")
+	})
+
+	t.Run("renders a dedicated readiness listener for specific binds", func(t *testing.T) {
+		t.Parallel()
+		loopback := "127.0.0.1"
+		parsed := render(t, readinessRenderSpec(&loopback))
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Name != "readiness" {
+			t.Errorf("readiness listener name: %q", readiness.Name)
+		}
+		if readiness.Address != "[::]:19902" {
+			t.Errorf("readiness listener must bind the dual-stack wildcard, got: %q", readiness.Address)
+		}
+		if len(readiness.FilterChains) != 1 || readiness.FilterChains[0] != "readiness" {
+			t.Errorf("readiness listener must reference its dedicated health-only chain, got: %v", readiness.FilterChains)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness")
+		if readiness.TLS != nil {
+			t.Errorf("readiness listener must not add TLS when the spec has none, got: %+v", readiness.TLS)
+		}
+	})
+
+	t.Run("mirrors the first listener's TLS for TLS-enabled proxies", func(t *testing.T) {
+		t.Parallel()
+		loopback := "127.0.0.1"
+		spec := readinessRenderSpec(&loopback)
+		spec.Listeners[0].TLS = &proxyv1alpha1.PraxisListenerTLS{
+			CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "gw-tls"},
+		}
+		parsed := render(t, spec)
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.TLS == nil {
+			t.Fatal("readiness listener must preserve the first listener's TLS")
+		}
+		if readiness.TLS.CertPath != "/etc/praxis/tls/http/tls.crt" {
+			t.Errorf("readiness listener cert_path: %s", readiness.TLS.CertPath)
+		}
+		if readiness.TLS.KeyPath != "/etc/praxis/tls/http/tls.key" {
+			t.Errorf("readiness listener key_path: %s", readiness.TLS.KeyPath)
+		}
+		if len(readiness.FilterChains) != 1 || readiness.FilterChains[0] != "readiness" {
+			t.Errorf("readiness listener must reference its dedicated health-only chain, got: %v", readiness.FilterChains)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness")
+	})
+
+	t.Run("binds the dual-stack wildcard for IPv6-specific binds", func(t *testing.T) {
+		t.Parallel()
+		loopback := "::1"
+		parsed := render(t, readinessRenderSpec(&loopback))
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Address != "[::]:19902" {
+			t.Errorf("readiness listener must bind the dual-stack wildcard for IPv6-specific binds, got: %q", readiness.Address)
+		}
+	})
+
+	t.Run("avoids spec listener names, chain names, and occupied ports", func(t *testing.T) {
+		t.Parallel()
+		loopback := "127.0.0.1"
+		spec := readinessRenderSpec(&loopback)
+		spec.Listeners[0].Name = "readiness"
+		spec.Listeners[0].Port = 19902
+		spec.Listeners[0].FilterChains = []string{"readiness"}
+		spec.FilterChains[0].Name = "readiness"
+		spec.Admin = &proxyv1alpha1.PraxisAdmin{Address: "127.0.0.1:19903"}
+		parsed := render(t, spec)
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Name != "readiness-0" {
+			t.Errorf("readiness listener must avoid the spec listener name, got: %q", readiness.Name)
+		}
+		if readiness.Address != "[::]:19904" {
+			t.Errorf("readiness listener must avoid occupied ports, got: %q", readiness.Address)
+		}
+		if len(readiness.FilterChains) != 1 || readiness.FilterChains[0] != "readiness-0" {
+			t.Errorf("readiness chain must avoid the spec chain name, got: %v", readiness.FilterChains)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness-0")
+	})
+}
+
+// assertReadinessHealthChain verifies the named chain is the readiness
+// listener's health-only pipeline: a single static_response filter that
+// answers with a fixed response without contacting any upstream — the
+// form the Praxis configuration reference documents for health checks.
+// The runtime rejects chainless HTTP listeners, so the chain is what
+// keeps the rendered config valid.
+func assertReadinessHealthChain(t *testing.T, parsed nativeConfig, name string) {
+	t.Helper()
+	var chain *nativeChain
+	for i := range parsed.FilterChains {
+		if parsed.FilterChains[i].Name == name {
+			chain = &parsed.FilterChains[i]
+		}
+	}
+	if chain == nil {
+		t.Fatalf("rendered config must define the %q health-only chain", name)
+	}
+	if len(chain.Filters) != 1 {
+		t.Fatalf("health-only chain must carry a single filter, got: %v", chain.Filters)
+	}
+	filter := chain.Filters[0]
+	if filter["filter"] != "static_response" {
+		t.Errorf("health-only chain must use the static_response filter, got: %v", filter["filter"])
+	}
+	status, ok := filter["status"].(float64)
+	if !ok || status != 200 {
+		t.Errorf("health-only chain must answer with a fixed 200 response, got: %v", filter["status"])
+	}
+}
+
+// readinessRenderSpec returns a minimal valid spec whose single listener
+// binds bindAddress (nil meaning the wildcard default).
+func readinessRenderSpec(bindAddress *string) *proxyv1alpha1.ProxySpec {
+	return &proxyv1alpha1.ProxySpec{
+		Image: "ghcr.io/praxis-proxy/praxis:latest",
+		Listeners: []proxyv1alpha1.PraxisListener{{
+			Name:         "http",
+			Port:         8080,
+			BindAddress:  bindAddress,
+			FilterChains: []string{"main"},
+		}},
+		FilterChains: []proxyv1alpha1.ProxyFilterChain{{
+			Name: "main",
+			Filters: []proxyv1alpha1.PraxisFilterEntry{{
+				Name:         "rl",
+				InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"},
+			}},
+		}},
 	}
 }

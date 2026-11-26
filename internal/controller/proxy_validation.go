@@ -8,7 +8,10 @@ import (
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 )
 
-const maxConditionMessageLen = 32768
+const (
+	maxConditionMessageLen = 32768
+	maxLabelValueLen       = 63
+)
 
 var terminalFilterTypes = map[string]bool{
 	"iterative_request_router": true,

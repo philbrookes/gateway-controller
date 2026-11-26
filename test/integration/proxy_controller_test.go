@@ -15,6 +15,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/yaml"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 	"github.com/praxis-proxy/gateway-controller/internal/controller"
@@ -247,6 +248,109 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("should mount the live configuration directory", func(ctx context.Context) {
+		proxy := validProxy("live-config")
+		createProxy(ctx, proxy)
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			volumes := deploy.Spec.Template.Spec.Volumes
+			gom.Expect(volumes).To(HaveLen(1))
+			gom.Expect(volumes[0].ConfigMap.Name).To(Equal(proxy.Name + "-config"))
+			mounts := deploy.Spec.Template.Spec.Containers[0].VolumeMounts
+			gom.Expect(mounts).To(HaveLen(1))
+			gom.Expect(mounts[0].MountPath).To(Equal("/etc/praxis/config"))
+			gom.Expect(mounts[0].SubPath).To(BeEmpty())
+			maps := &corev1.ConfigMapList{}
+			gom.Expect(k8sClient.List(ctx, maps, client.InNamespace(proxy.Namespace))).To(Succeed())
+			var owned []corev1.ConfigMap
+			for _, cm := range maps.Items {
+				if metav1.IsControlledBy(&cm, proxy) {
+					owned = append(owned, cm)
+				}
+			}
+			gom.Expect(owned).To(HaveLen(1))
+			gom.Expect(owned[0].Data["config.yaml"]).To(ContainSubstring("listeners"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("targets a dedicated readiness listener when no listener is pod-IP-reachable", func(ctx context.Context) {
+		// renderedListener mirrors the listener entries of the rendered
+		// Praxis config for structural assertions on config.yaml.
+		type renderedListener struct {
+			Name         string   `json:"name"`
+			Address      string   `json:"address"`
+			FilterChains []string `json:"filter_chains"`
+		}
+		type renderedChain struct {
+			Name    string           `json:"name"`
+			Filters []map[string]any `json:"filters"`
+		}
+		type renderedConfig struct {
+			Listeners    []renderedListener `json:"listeners"`
+			FilterChains []renderedChain    `json:"filter_chains"`
+		}
+		proxy := validProxy("readiness-dedicated")
+		loopback := "127.0.0.1"
+		proxy.Spec.Listeners[0].BindAddress = &loopback
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			// The kubelet dials the pod IP, which no specifically-bound
+			// listener answers; the probe must target the controller's
+			// dedicated readiness listener instead.
+			probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+			gom.Expect(probe).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("readiness"))
+
+			var readinessPort int32
+			for _, port := range deploy.Spec.Template.Spec.Containers[0].Ports {
+				if port.Name == "readiness" {
+					readinessPort = port.ContainerPort
+				}
+			}
+			gom.Expect(readinessPort).To(Equal(int32(19902)))
+
+			cm := &corev1.ConfigMap{}
+			gom.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      proxy.Name + "-config",
+				Namespace: proxy.Namespace,
+			}, cm)).To(Succeed())
+			// The dedicated readiness listener must be health-only: it
+			// binds the dual-stack wildcard so the kubelet's dial to the
+			// pod IP succeeds on either family, and its chain cannot
+			// route application traffic.
+			var rendered renderedConfig
+			gom.Expect(yaml.Unmarshal([]byte(cm.Data["config.yaml"]), &rendered)).To(Succeed())
+			var readiness *renderedListener
+			for i := range rendered.Listeners {
+				if rendered.Listeners[i].Name == "readiness" {
+					readiness = &rendered.Listeners[i]
+				}
+			}
+			gom.Expect(readiness).NotTo(BeNil())
+			gom.Expect(readiness.Address).To(Equal("[::]:19902"))
+			// The readiness listener references a dedicated health-only
+			// chain — the Praxis validator rejects chainless HTTP
+			// listeners — whose single static_response filter answers
+			// with a fixed response without contacting any upstream.
+			gom.Expect(readiness.FilterChains).To(Equal([]string{"readiness"}))
+			var healthChain *renderedChain
+			for i := range rendered.FilterChains {
+				if rendered.FilterChains[i].Name == "readiness" {
+					healthChain = &rendered.FilterChains[i]
+				}
+			}
+			gom.Expect(healthChain).NotTo(BeNil())
+			gom.Expect(healthChain.Filters).To(HaveLen(1))
+			gom.Expect(healthChain.Filters[0]["filter"]).To(Equal("static_response"))
+			gom.Expect(healthChain.Filters[0]["status"]).To(Equal(float64(200)))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should set Programmed condition for a valid proxy", func(ctx context.Context) {
 		proxy := validProxy("programmed")
 		createProxy(ctx, proxy)
@@ -323,6 +427,112 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(2 * time.Second).Should(Succeed())
 	})
 
+	It("should create a Deployment with correct container spec", func(ctx context.Context) {
+		proxy := validProxy("deploy")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			gom.Expect(deploy.OwnerReferences).To(HaveLen(1))
+			gom.Expect(deploy.OwnerReferences[0].Name).To(Equal(proxy.Name))
+			gom.Expect(*deploy.Spec.Replicas).To(Equal(int32(1)))
+			containers := deploy.Spec.Template.Spec.Containers
+			gom.Expect(containers).To(HaveLen(1))
+			gom.Expect(containers[0].Image).To(Equal(proxy.Spec.Image))
+			// The listener port plus the controller-rendered dual-stack
+			// readiness port: the default bind renders the IPv4 wildcard,
+			// which is not reachable through an IPv6 pod IP.
+			gom.Expect(containers[0].Ports).To(HaveLen(2))
+			gom.Expect(containers[0].Ports[0].ContainerPort).To(Equal(int32(8080)))
+			gom.Expect(containers[0].Ports[1].Name).To(Equal("readiness"))
+			gom.Expect(containers[0].Ports[1].ContainerPort).To(Equal(int32(19902)))
+			gom.Expect(deploy.Spec.Template.Annotations).To(HaveKey("praxis.io/startup-revision"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("keeps replacement pods unready until the listener readiness probe succeeds", func(ctx context.Context) {
+		proxy := validProxy("readiness-probe")
+		createProxy(ctx, proxy)
+
+		// envtest runs no kubelet, so the observable contract is the probe
+		// wiring: the pod template must carry a TCP readiness probe. The
+		// default bind renders the IPv4 wildcard, which never answers the
+		// kubelet's dial to an IPv6 pod IP, so the probe targets the
+		// controller's dedicated dual-stack readiness listener. Kubernetes
+		// then holds a replacement pod out of the Service endpoints until
+		// Praxis has bound the listener and the probe connection succeeds.
+		var revisionBefore string
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			containers := deploy.Spec.Template.Spec.Containers
+			gom.Expect(containers).To(HaveLen(1))
+			probe := containers[0].ReadinessProbe
+			gom.Expect(probe).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("readiness"))
+			revisionBefore = deploy.Spec.Template.Annotations["praxis.io/startup-revision"]
+			gom.Expect(revisionBefore).NotTo(BeEmpty())
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// Listener changes require a new process and must roll a replacement pod.
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.Listeners[0].Port = 9090
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			// The replacement template carries a new startup revision...
+			gom.Expect(deploy.Spec.Template.Annotations["praxis.io/startup-revision"]).
+				NotTo(Equal(revisionBefore))
+			// ...and its pods stay probe-gated until the listener
+			// accepts connections.
+			probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
+			gom.Expect(probe).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket).NotTo(BeNil())
+			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("readiness"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should publish filter changes without changing the pod template", func(ctx context.Context) {
+		proxy := validProxy("update-filter")
+		createProxy(ctx, proxy)
+
+		var originalTemplate corev1.PodTemplateSpec
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			originalTemplate = deploy.Spec.Template
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.FilterChains[0].Filters[0].InlineFilter.Type = "access_log"
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			cm := &corev1.ConfigMap{}
+			gom.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: proxy.Name + "-config", Namespace: proxy.Namespace,
+			}, cm)).To(Succeed())
+			gom.Expect(cm.Data["config.yaml"]).To(ContainSubstring("access_log"))
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			gom.Expect(deploy.Spec.Template).To(Equal(originalTemplate))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should set Accepted=False and ResolvedRefs=False for unrenderable filter", func(ctx context.Context) {
 		proxy := validProxy("render-error")
 		proxy.Spec.FilterChains[0].Filters[0] = proxyv1alpha1.PraxisFilterEntry{
@@ -367,7 +577,7 @@ var _ = Describe("Proxy Controller", func() {
 				gom.Expect(condition.Message).To(ContainSubstring("resolve policy"))
 			}
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
-		for _, object := range []client.Object{&corev1.ConfigMap{}} {
+		for _, object := range []client.Object{&corev1.ConfigMap{}, &appsv1.Deployment{}} {
 			key := client.ObjectKeyFromObject(proxy)
 			if _, ok := object.(*corev1.ConfigMap); ok {
 				key.Name += "-config"
