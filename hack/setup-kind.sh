@@ -42,6 +42,42 @@ create_cluster() {
 }
 
 # ---------------------------------------------------------------------------
+# kube-proxy mode
+# ---------------------------------------------------------------------------
+
+# kube-proxy defaults to iptables mode, whose legacy ip6tables backend
+# cannot program Service rules on the nftables-based kernels kind nodes use
+# when the cluster's primary Service family is IPv6: kube-proxy exits with
+# "no support for primary IP family IPv6", ClusterIPs stop routing, and
+# every component that talks to the API through the kubernetes Service
+# (CoreDNS, MetalLB, the manager) stops working. nftables mode programs the
+# kernel directly and serves both families, so switch to it before anything
+# depends on Service routing. IPv4-primary clusters keep the default.
+ensure_kube_proxy_nftables() {
+    local primary_family mode
+    primary_family="$(${KUBECTL} -n default get service kubernetes \
+        -o jsonpath='{.spec.ipFamilies[0]}')"
+    if [ "${primary_family}" != "IPv6" ]; then
+        return
+    fi
+
+    echo "==> Cluster primary Service family is IPv6; switching kube-proxy to nftables mode..."
+    ${KUBECTL} -n kube-system get configmap kube-proxy -o yaml \
+        | sed -E 's/^([[:space:]]*)mode: "?iptables"?$/\1mode: nftables/' \
+        | ${KUBECTL} replace -f - > /dev/null
+
+    mode="$(${KUBECTL} -n kube-system get configmap kube-proxy \
+        -o jsonpath='{.data.config\.conf}' | grep -E '^mode:' || true)"
+    if [ "${mode}" != "mode: nftables" ]; then
+        echo "ERROR: expected kube-proxy mode 'nftables', got '${mode:-none}'"
+        exit 1
+    fi
+
+    ${KUBECTL} -n kube-system rollout restart daemonset/kube-proxy
+    ${KUBECTL} -n kube-system rollout status daemonset/kube-proxy --timeout=180s
+}
+
+# ---------------------------------------------------------------------------
 # Gateway API CRDs
 # ---------------------------------------------------------------------------
 
@@ -201,6 +237,7 @@ if [ -z "${CONTAINER_ENGINE}" ]; then
 fi
 
 create_cluster
+ensure_kube_proxy_nftables
 # Add back if/when gateway API is needed
 #install_gateway_api
 install_metallb
