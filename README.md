@@ -26,7 +26,10 @@ the proxy and mounting them into the Praxis container are tracked separately, so
 until then a proxy with a policy reference renders and reports `Accepted=True`
 while its runtime has no policy document to load. A missing `Policy` fails
 rendering with `Accepted=False` and `ResolvedRefs=False` (`ConfigRenderError`),
-and the last valid configuration stays published.
+and the last valid configuration stays published. The controller does not yet
+watch `Policy` resources, so editing or deleting a referenced `Policy` does not
+re-render the proxy until another event triggers reconciliation (tracked in
+[#20](https://github.com/praxis-proxy/gateway-controller/issues/20)).
 
 ## Development
 
@@ -97,8 +100,6 @@ without taking a dependency on the full stack before it is ready.
   improvements
 - Never merge `aigateway` back to `main`; the history flows one direction only
 
-Shared changes (CI, documentation, shared utilities) land on `main` first, then
-flow to `aigateway` via rebase.
 Shared changes (CI, documentation, shared utilities) land on `main` first, then
 flow to `aigateway` via rebase.
 
