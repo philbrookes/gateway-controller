@@ -2,6 +2,18 @@
 
 This controller will manage the Kubernetes based control plane API for Gateway implementations such as AI Gateway.
 
+## Policy filter references
+
+Policy filter references render to the native policy filter: the controller
+resolves the referenced `Policy`, copies its filter options into the rendered
+entry, and points `config_path` at `/etc/praxis/policies/{namespace}/{name}.yaml`,
+collecting each referenced document under that path. Publishing the documents to
+the proxy and mounting them into the Praxis container are tracked separately, so
+until then a proxy with a policy reference renders and reports `Accepted=True`
+while its runtime has no policy document to load. A missing `Policy` fails
+rendering with `Accepted=False` and `ResolvedRefs=False` (`ConfigRenderError`),
+and the last valid configuration stays published.
+
 ## Development
 
 Run `make help` for the full target list. The common ones:
