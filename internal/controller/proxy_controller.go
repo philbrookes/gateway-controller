@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -98,6 +99,24 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, err
 	}
 	proxy.Status.DesiredRevision = revision
+
+	// A Service's allocated families are immutable, so a bind change
+	// that drops a retained family can never be published while that
+	// Service exists. Reject the change before the ConfigMap and
+	// Deployment are updated, and report it in status rather than
+	// failing after they are already published.
+	var existingSvc corev1.Service
+	if err := r.Get(ctx, client.ObjectKeyFromObject(&proxy), &existingSvc); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("get service: %w", err)
+	}
+	if conflict := retainedFamilyConflict(&proxy, &existingSvc); conflict != nil {
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
+			metav1.ConditionFalse, "ServiceFamilyConflict", conflict.Error(), proxy.Generation)
+		if patchErr := r.Status().Patch(ctx, &proxy, patch); patchErr != nil {
+			return ctrl.Result{}, patchErr
+		}
+		return ctrl.Result{}, nil
+	}
 
 	if err := r.reconcileConfigMap(ctx, &proxy, configData); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile configmap: %w", err)
@@ -449,6 +468,37 @@ func serviceIPFamilies(proxy *proxyv1alpha1.Proxy) ([]corev1.IPFamily, corev1.IP
 	default:
 		return nil, corev1.IPFamilyPolicyPreferDualStack
 	}
+}
+
+// retainedFamilyConflict reports the listeners that cannot accept
+// traffic on a family the existing Service already allocated. Service
+// IP families are immutable, so a bind that drops a retained family
+// can never be published while that Service exists; the caller rejects
+// the change before publishing configuration or workloads. A Service
+// with no allocated families constrains nothing.
+func retainedFamilyConflict(proxy *proxyv1alpha1.Proxy, svc *corev1.Service) error {
+	retained := make([]string, 0, len(svc.Spec.IPFamilies))
+	var conflicts []string
+	for _, family := range svc.Spec.IPFamilies {
+		retained = append(retained, string(family))
+		for i := range proxy.Spec.Listeners {
+			listener := &proxy.Spec.Listeners[i]
+			acceptsV4, acceptsV6 := listenerBindFamilies(listener.BindAddress)
+			if (family == corev1.IPv4Protocol && acceptsV4) || (family == corev1.IPv6Protocol && acceptsV6) {
+				continue
+			}
+			bind := "0.0.0.0" // the spec default for an unset bind
+			if listener.BindAddress != nil {
+				bind = *listener.BindAddress
+			}
+			conflicts = append(conflicts, fmt.Sprintf("listener %q binds %s, which does not accept %s", listener.Name, bind, family))
+		}
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("the Service %s/%s retains %s, but %s; Service IP families are immutable, so revert the bindAddress or delete the Service to reallocate",
+		svc.Namespace, svc.Name, strings.Join(retained, ", "), strings.Join(conflicts, "; "))
 }
 
 // listenerBindFamilies reports which address families a listener's bind

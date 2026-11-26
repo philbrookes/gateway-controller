@@ -688,6 +688,79 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("reports a Service family conflict in status when a bind drops a retained family", func(ctx context.Context) {
+		proxy := validProxy("svc-family-conflict")
+		createProxy(ctx, proxy)
+
+		// The API server here is single-family and allocates [IPv4].
+		var originalRevision string
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.IPFamilies).To(Equal([]corev1.IPFamily{corev1.IPv4Protocol}))
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.PublishedRevision).NotTo(BeEmpty())
+			originalRevision = got.Status.PublishedRevision
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			v6 := "fd00::1"
+			got.Spec.Listeners[0].BindAddress = &v6
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// The retained IPv4 family is immutable on the Service, so the
+		// reconcile must say so in status instead of publishing the new
+		// configuration and workload first and failing on the Service
+		// update afterwards.
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(cond.Reason).To(Equal("ServiceFamilyConflict"))
+			gom.Expect(cond.Message).To(ContainSubstring(`listener "http"`))
+			gom.Expect(cond.Message).To(ContainSubstring("fd00::1"))
+			gom.Expect(cond.Message).To(ContainSubstring("IPv4"))
+			gom.Expect(got.Status.PublishedRevision).To(Equal(originalRevision))
+			cm := &corev1.ConfigMap{}
+			gom.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name: proxy.Name + "-config", Namespace: proxy.Namespace,
+			}, cm)).To(Succeed())
+			gom.Expect(cm.Data["config.yaml"]).NotTo(ContainSubstring("fd00::1"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// A bind that accepts the retained family publishes again and
+		// clears the conflict.
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			wildcard := "::"
+			got.Spec.Listeners[0].BindAddress = &wildcard
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			gom.Expect(got.Status.PublishedRevision).NotTo(Equal(originalRevision))
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.IPFamilies).To(Equal([]corev1.IPFamily{corev1.IPv4Protocol}))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should update Service type when spec.service.type changes", func(ctx context.Context) {
 		proxy := validProxy("update-svc-type")
 		createProxy(ctx, proxy)
