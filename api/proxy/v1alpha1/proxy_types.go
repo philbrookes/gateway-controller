@@ -118,11 +118,16 @@ type PraxisSecretKeyRef struct {
 
 // PraxisListener defines a single listener on the proxy.
 type PraxisListener struct {
-	// name is the unique listener and generated Service port name.
+	// name is the unique listener and generated container and Service
+	// port name, so it must satisfy Kubernetes port-name validation (an
+	// IANA service name, RFC 6335): lowercase letters, digits, and
+	// hyphens, with at least one letter and no leading, trailing, or
+	// consecutive hyphens. Names like "123" or "http--api" would make
+	// the generated Deployment fail container-port validation.
 	// +kubebuilder:validation:Required
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=15
-	// +kubebuilder:validation:Pattern=`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`
+	// +kubebuilder:validation:Pattern=`^([a-z0-9]+-)*[a-z0-9]*[a-z][a-z0-9]*(-[a-z0-9]+)*$`
 	Name string `json:"name"`
 
 	// port is the container and Service port.
@@ -235,6 +240,7 @@ type PraxisListenerStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 // +kubebuilder:validation:XValidation:rule="size(self.metadata.name) <= 63",message="proxy name must not exceed 63 characters"
+// +kubebuilder:validation:XValidation:rule="self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')",message="proxy name must be a lowercase DNS label (alphanumerics and hyphens, starting and ending with an alphanumeric) because the controller names the generated Service after the proxy"
 
 // Proxy owns the Praxis Deployment, Service, config, assets, and listeners.
 type Proxy struct {

@@ -532,11 +532,16 @@ spec:
                         type: string
                       type: array
                     name:
-                      description: name is the unique listener and generated Service
-                        port name.
+                      description: |-
+                        name is the unique listener and generated container and Service
+                        port name, so it must satisfy Kubernetes port-name validation (an
+                        IANA service name, RFC 6335): lowercase letters, digits, and
+                        hyphens, with at least one letter and no leading, trailing, or
+                        consecutive hyphens. Names like "123" or "http--api" would make
+                        the generated Deployment fail container-port validation.
                       maxLength: 15
                       minLength: 1
-                      pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                      pattern: ^([a-z0-9]+-)*[a-z0-9]*[a-z][a-z0-9]*(-[a-z0-9]+)*$
                       type: string
                     port:
                       description: port is the container and Service port.
@@ -804,6 +809,10 @@ spec:
         x-kubernetes-validations:
         - message: proxy name must not exceed 63 characters
           rule: size(self.metadata.name) <= 63
+        - message: proxy name must be a lowercase DNS label (alphanumerics and hyphens,
+            starting and ending with an alphanumeric) because the controller names
+            the generated Service after the proxy
+          rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     served: true
     storage: true
     subresources:

@@ -154,6 +154,18 @@ var _ = Describe("Proxy CRD", func() {
 			func(spec *proxyv1alpha1.ProxySpec) {
 				spec.Listeners[0].Name = "UPPER"
 			}),
+		// Listener names flow verbatim into container and Service port
+		// names, so they must satisfy Kubernetes port-name validation
+		// (an IANA service name, RFC 6335), not just the DNS-label-ish
+		// shape the previous pattern checked.
+		Entry("a listener name with no letters", "numeric-listener-name",
+			func(spec *proxyv1alpha1.ProxySpec) {
+				spec.Listeners[0].Name = "123"
+			}),
+		Entry("a listener name with consecutive hyphens", "double-hyphen-listener-name",
+			func(spec *proxyv1alpha1.ProxySpec) {
+				spec.Listeners[0].Name = "http--api"
+			}),
 		Entry("a listener bindAddress that is a hostname", "hostname-bind",
 			func(spec *proxyv1alpha1.ProxySpec) {
 				bind := "listener.example.com"
@@ -186,6 +198,23 @@ var _ = Describe("Proxy CRD", func() {
 		}
 		err := k8sClient.Create(ctx, proxy)
 		Expect(err).To(HaveOccurred(), "the apiserver should reject a Proxy with a name > 63 chars")
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(),
+			"expected a validation error, got: %v", err)
+	})
+
+	// The controller names the generated Service after the proxy, and
+	// Service names must be DNS labels, so a dotted proxy name passes
+	// admission only to fail at Service creation.
+	It("rejects a Proxy whose name is not a DNS label", func(ctx context.Context) {
+		proxy := &proxyv1alpha1.Proxy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "edge.production",
+				Namespace: "default",
+			},
+			Spec: validProxySpec(),
+		}
+		err := k8sClient.Create(ctx, proxy)
+		Expect(err).To(HaveOccurred(), "the apiserver should reject a Proxy whose name cannot become a Service name")
 		Expect(apierrors.IsInvalid(err)).To(BeTrue(),
 			"expected a validation error, got: %v", err)
 	})
@@ -248,5 +277,38 @@ var _ = Describe("Proxy CRD", func() {
 		Entry("IPv6 loopback", "::1"),
 		Entry("IPv6 literal", "fd00::1"),
 		Entry("full IPv6 literal", "2001:db8:1:2:3:4:5:6"),
+	)
+
+	// Listener names are used verbatim as container and Service port
+	// names, so the pattern must admit exactly the names Kubernetes
+	// port-name validation accepts: IANA service names (RFC 6335) —
+	// lowercase letters and digits with single non-edge hyphens and at
+	// least one letter.
+	DescribeTable("accepts a valid Proxy with port-compatible listener names",
+		func(ctx context.Context, name string) {
+			proxy := &proxyv1alpha1.Proxy{
+				ObjectMeta: metav1.ObjectMeta{
+					GenerateName: "valid-listener-",
+					Namespace:    "default",
+				},
+				Spec: proxyv1alpha1.ProxySpec{
+					Image: "example.com/praxis:latest",
+					Listeners: []proxyv1alpha1.PraxisListener{
+						{Name: name, Port: 8080},
+					},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, proxy)).To(Succeed(), "a Proxy with listener name %q should be admitted", name)
+
+			DeferCleanup(func(ctx context.Context) error {
+				return client.IgnoreNotFound(k8sClient.Delete(ctx, proxy))
+			})
+		},
+		Entry("a single letter", "a"),
+		Entry("letters and digits", "http1"),
+		Entry("a leading digit with a letter", "1http"),
+		Entry("a hyphenated name", "http-api"),
+		Entry("a hyphenated name with digits", "a-1"),
 	)
 })
