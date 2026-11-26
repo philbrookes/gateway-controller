@@ -104,6 +104,23 @@ func unownedDeployment() *appsv1.Deployment {
 	}
 }
 
+func unownedService() *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "gw",
+			Namespace:         "default",
+			UID:               "svc-uid",
+			CreationTimestamp: metav1.Now(),
+		},
+		Spec: corev1.ServiceSpec{
+			Type: corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{{
+				Name: "user", Port: 9999, Protocol: corev1.ProtocolTCP,
+			}},
+		},
+	}
+}
+
 func podTemplateWithImage(image string) corev1.PodTemplateSpec {
 	return corev1.PodTemplateSpec{
 		Spec: corev1.PodSpec{
@@ -197,6 +214,41 @@ func TestReconcileResources_RefuseUnownedObjects(t *testing.T) {
 					t.Errorf("foreign-owned Deployment was overwritten: %+v", deploy.Spec.Template.Spec.Containers)
 				}
 				if owner := metav1.GetControllerOf(deploy); owner == nil || owner.UID != "foreign-uid" {
+					t.Errorf("foreign controller owner was replaced: %+v", owner)
+				}
+			},
+		},
+		{
+			name:      "service without controller owner",
+			existing:  unownedService(),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileService(ctx, proxy) },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &corev1.Service{} },
+			check: func(t *testing.T, got client.Object) {
+				svc := got.(*corev1.Service)
+				if svc.Spec.Type != corev1.ServiceTypeNodePort {
+					t.Errorf("unowned Service type was changed: %s", svc.Spec.Type)
+				}
+				if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 9999 {
+					t.Errorf("unowned Service ports were changed: %+v", svc.Spec.Ports)
+				}
+				if owner := metav1.GetControllerOf(svc); owner != nil {
+					t.Errorf("unowned Service was adopted by %q", owner.Name)
+				}
+			},
+		},
+		{
+			name:      "service controlled by another controller",
+			existing:  withForeignOwner(unownedService()),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileService(ctx, proxy) },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &corev1.Service{} },
+			check: func(t *testing.T, got client.Object) {
+				svc := got.(*corev1.Service)
+				if svc.Spec.Type != corev1.ServiceTypeNodePort {
+					t.Errorf("foreign-owned Service type was changed: %s", svc.Spec.Type)
+				}
+				if owner := metav1.GetControllerOf(svc); owner == nil || owner.UID != "foreign-uid" {
 					t.Errorf("foreign controller owner was replaced: %+v", owner)
 				}
 			},
@@ -309,6 +361,38 @@ func TestReconcileResources_MutateOwnedAndCreateObjects(t *testing.T) {
 				}
 				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != 1 {
 					t.Errorf("replicas: %v", deploy.Spec.Replicas)
+				}
+			},
+		},
+		{
+			name:      "service absent is created",
+			existing:  nil,
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileService(ctx, proxy) },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &corev1.Service{} },
+			check: func(t *testing.T, got client.Object) {
+				svc := got.(*corev1.Service)
+				if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 8080 || svc.Spec.Ports[0].Name != "http" {
+					t.Errorf("service ports: %+v", svc.Spec.Ports)
+				}
+				if owner := metav1.GetControllerOf(svc); owner == nil || owner.UID != proxy.UID {
+					t.Errorf("controller owner: %+v", owner)
+				}
+			},
+		},
+		{
+			name:      "service owned by proxy is updated",
+			existing:  withControllerOwner(unownedService(), proxy),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileService(ctx, proxy) },
+			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch:     func() client.Object { return &corev1.Service{} },
+			check: func(t *testing.T, got client.Object) {
+				svc := got.(*corev1.Service)
+				if svc.Spec.Type != corev1.ServiceTypeClusterIP {
+					t.Errorf("service type: %s", svc.Spec.Type)
+				}
+				if len(svc.Spec.Ports) != 1 || svc.Spec.Ports[0].Port != 8080 {
+					t.Errorf("service ports: %+v", svc.Spec.Ports)
 				}
 			},
 		},

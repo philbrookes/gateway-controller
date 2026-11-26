@@ -501,6 +501,22 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("should create a Service exposing listener ports", func(ctx context.Context) {
+		proxy := validProxy("svc")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.OwnerReferences).To(HaveLen(1))
+			gom.Expect(svc.OwnerReferences[0].Name).To(Equal(proxy.Name))
+			gom.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+			gom.Expect(svc.Spec.Ports).To(HaveLen(1))
+			gom.Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+			gom.Expect(svc.Spec.Ports[0].Name).To(Equal("http"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should publish filter changes without changing the pod template", func(ctx context.Context) {
 		proxy := validProxy("update-filter")
 		createProxy(ctx, proxy)
@@ -577,7 +593,7 @@ var _ = Describe("Proxy Controller", func() {
 				gom.Expect(condition.Message).To(ContainSubstring("resolve policy"))
 			}
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
-		for _, object := range []client.Object{&corev1.ConfigMap{}, &appsv1.Deployment{}} {
+		for _, object := range []client.Object{&corev1.ConfigMap{}, &appsv1.Deployment{}, &corev1.Service{}} {
 			key := client.ObjectKeyFromObject(proxy)
 			if _, ok := object.(*corev1.ConfigMap); ok {
 				key.Name += "-config"

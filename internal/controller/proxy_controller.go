@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +36,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=praxis.io,resources=policies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 
 func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -92,6 +94,9 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("reconcile deployment: %w", err)
 	}
 
+	if err := r.reconcileService(ctx, &proxy); err != nil {
+		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
+	}
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
 		metav1.ConditionTrue, "ConfigPublished", "Configuration rendered to ConfigMap", proxy.Generation)
 
@@ -343,10 +348,105 @@ func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
 	}
 	return envVars
 }
+func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1alpha1.Proxy) error {
+	desired := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxy.Name,
+			Namespace: proxy.Namespace,
+		},
+	}
+	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, desired, func() error {
+		if err := ensureControlledBy(desired, proxy, schema.GroupResource{Group: "", Resource: "services"}); err != nil {
+			return err
+		}
+		if err := controllerutil.SetControllerReference(proxy, desired, r.Scheme); err != nil {
+			return err
+		}
+		desired.Spec.Selector = proxyLabels(proxy)
+		desired.Spec.Type = serviceType(proxy)
+		desired.Spec.Ports = buildServicePorts(proxy)
+		families, familyPolicy := serviceIPFamilies(proxy)
+		desired.Spec.IPFamilies = families
+		desired.Spec.IPFamilyPolicy = &familyPolicy
+		return nil
+	})
+	return err
+}
+
+// serviceIPFamilies returns the address families the proxy's Service
+// must allocate cluster IPs in, and the policy that requests them, so a
+// published Service only carries traffic the proxy's application
+// listeners can accept.
+//
+// A listener binds IPv4 unless it names an IPv6 address: the spec default
+// (and the renderer's default bind) is the IPv4 wildcard, which never
+// accepts a connection to an IPv6 address, while the IPv6 wildcard ::
+// accepts both families. The Service therefore follows the listeners.
+// IPv4-only binds keep the IPv4 family — today's behavior on IPv4
+// clusters, and a compatible choice on dual-stack clusters whose primary
+// family is IPv6, where a defaulted Service would be IPv6 and its
+// traffic unreachable for the default binds. Explicit IPv6 binds move
+// the Service to IPv6, and a mix — or a dual-stack wildcard — asks for
+// both families, which single-family clusters trim at admission.
+// Clusters without any requested family reject the Service instead of
+// publishing an unreachable one.
+func serviceIPFamilies(proxy *proxyv1alpha1.Proxy) ([]corev1.IPFamily, corev1.IPFamilyPolicy) {
+	v4, v6 := false, false
+	for i := range proxy.Spec.Listeners {
+		l4, l6 := listenerBindFamilies(proxy.Spec.Listeners[i].BindAddress)
+		v4, v6 = v4 || l4, v6 || l6
+	}
+	switch {
+	case v4 && v6:
+		return []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol}, corev1.IPFamilyPolicyPreferDualStack
+	case v6:
+		return []corev1.IPFamily{corev1.IPv6Protocol}, corev1.IPFamilyPolicySingleStack
+	default:
+		return []corev1.IPFamily{corev1.IPv4Protocol}, corev1.IPFamilyPolicySingleStack
+	}
+}
+
+// listenerBindFamilies reports which address families a listener's bind
+// address accepts. A nil bind renders as the IPv4 wildcard. An unparseable
+// bind cannot name an IPv6 address, so it is treated like the IPv4 default
+// rather than pinning the Service to a family the listener may not accept.
+func listenerBindFamilies(bind *string) (v4, v6 bool) {
+	if bind == nil {
+		return true, false
+	}
+	ip := net.ParseIP(*bind)
+	switch {
+	case ip == nil, ip.To4() != nil:
+		return true, false
+	case ip.IsUnspecified():
+		return true, true
+	default:
+		return false, true
+	}
+}
+func serviceType(proxy *proxyv1alpha1.Proxy) corev1.ServiceType {
+	if proxy.Spec.Service != nil && proxy.Spec.Service.Type != nil {
+		return corev1.ServiceType(*proxy.Spec.Service.Type)
+	}
+	return corev1.ServiceTypeClusterIP
+}
+func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
+	ports := make([]corev1.ServicePort, 0, len(proxy.Spec.Listeners))
+	for _, listener := range proxy.Spec.Listeners {
+		ports = append(ports, corev1.ServicePort{
+			Name:       listener.Name,
+			Port:       listener.Port,
+			TargetPort: intstr.FromString(listener.Name),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
+	return ports
+}
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.Proxy{}).
 		Owns(&corev1.ConfigMap{}).
 		Owns(&appsv1.Deployment{}).
+		Owns(&corev1.Service{}).
 		Complete(r)
 }
