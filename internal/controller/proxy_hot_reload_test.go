@@ -4,14 +4,17 @@ import (
 	"context"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 )
 
 func TestReconcileProxy_RolloutTriggers(t *testing.T) {
@@ -165,5 +168,81 @@ func TestBuildPodTemplate_ConfigAndTLSMounts(t *testing.T) {
 				t.Errorf("mount %q overlaps nested mount %q", mount.MountPath, other.MountPath)
 			}
 		}
+	}
+}
+
+// TestReconcileProxy_UnchangedReconcileSkipsDeploymentUpdate pins the
+// CreateOrUpdate contract for the pod template: the template the
+// controller builds must equal the one the API server stores, which
+// carries defaulted fields a raw template leaves unset — an empty pod
+// securityContext and the ConfigMap/Secret volume defaultMode. A
+// mismatch makes every unchanged reconcile send a Deployment update
+// that only clears those defaults again.
+func TestReconcileProxy_UnchangedReconcileSkipsDeploymentUpdate(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+	proxy := guardTestProxy()
+	// A TLS listener mounts a Secret volume, so the check covers both
+	// volume kinds the controller builds.
+	proxy.Spec.Listeners = append(proxy.Spec.Listeners, proxyv1alpha1.PraxisListener{
+		Name: "tls", Port: 8443, FilterChains: []string{"main"},
+		TLS: &proxyv1alpha1.PraxisListenerTLS{
+			CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "gw-tls"},
+		},
+	})
+
+	var deploymentUpdates atomic.Int32
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*appsv1.Deployment); ok {
+					deploymentUpdates.Add(1)
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).
+		Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+	reconcile := func() {
+		t.Helper()
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile proxy: %v", err)
+		}
+	}
+
+	reconcile()
+
+	// Simulate the API server's pod-template defaulting on the stored
+	// Deployment: an empty securityContext and defaultMode 0644 on the
+	// ConfigMap and Secret volumes.
+	deploy := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, deploy); err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	deploy.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	for i := range deploy.Spec.Template.Spec.Volumes {
+		vol := &deploy.Spec.Template.Spec.Volumes[i]
+		switch {
+		case vol.ConfigMap != nil:
+			vol.ConfigMap.DefaultMode = new(int32(0o644))
+		case vol.Secret != nil:
+			vol.Secret.DefaultMode = new(int32(0o644))
+		}
+	}
+	if err := cl.Update(ctx, deploy); err != nil {
+		t.Fatalf("seed API-defaulted deployment: %v", err)
+	}
+	deploymentUpdates.Store(0)
+
+	// An unchanged reconcile against the API-defaulted Deployment must
+	// make no Deployment update request.
+	reconcile()
+	if n := deploymentUpdates.Load(); n != 0 {
+		t.Fatalf("unchanged reconcile sent %d Deployment update requests, want 0", n)
 	}
 }

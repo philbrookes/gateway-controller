@@ -25,6 +25,9 @@ import (
 const (
 	containerName                 = "praxis"
 	defaultTerminationGracePeriod = int64(30)
+	// volumeDefaultMode mirrors the mode the API server defaults
+	// ConfigMap and Secret volumes to when it is left unset.
+	volumeDefaultMode = 0o644
 )
 
 type ProxyReconciler struct {
@@ -269,16 +272,27 @@ func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTem
 			DNSPolicy:                     corev1.DNSClusterFirst,
 			TerminationGracePeriodSeconds: &gracePeriod,
 			SchedulerName:                 corev1.DefaultSchedulerName,
+			// The API server defaults an unset pod securityContext to
+			// the empty value on the stored template; emit it explicitly
+			// so an unchanged reconcile does not clear it and send a
+			// Deployment update the API server only absorbs as a no-op.
+			SecurityContext: &corev1.PodSecurityContext{},
 		},
 	}
 }
 
 func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeMount) {
+	// The API server defaults an unset ConfigMap or Secret volume
+	// defaultMode to 0644 on the stored template; emit it explicitly so
+	// an unchanged reconcile does not clear it and send a Deployment
+	// update the API server only absorbs as a no-op.
+	defaultMode := new(int32(volumeDefaultMode))
 	volumes := []corev1.Volume{{
 		Name: configVolumeName,
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{Name: configMapName(proxy)},
+				DefaultMode:          defaultMode,
 			},
 		},
 	}}
@@ -297,7 +311,8 @@ func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeM
 			Name: volName,
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: listener.TLS.CertificateRef.Name,
+					SecretName:  listener.TLS.CertificateRef.Name,
+					DefaultMode: defaultMode,
 				},
 			},
 		})
