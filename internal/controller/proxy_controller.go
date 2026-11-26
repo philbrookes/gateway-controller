@@ -35,9 +35,9 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=praxis.io,resources=policies,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=praxis.io,resources=policies,verbs=get;list;watch
 
 func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -53,8 +53,18 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	proxy.Status.ObservedGeneration = proxy.Generation
 
 	if validationErrs := validateProxySpec(&proxy.Spec); len(validationErrs) > 0 {
-		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
-			metav1.ConditionFalse, "ValidationError", joinValidationErrors(validationErrs), proxy.Generation)
+		message := joinValidationErrors(validationErrs)
+		for _, conditionType := range []string{
+			proxyv1alpha1.ConditionTypeAccepted, proxyv1alpha1.ConditionTypeResolvedRefs,
+			proxyv1alpha1.ConditionTypeProgrammed, proxyv1alpha1.ConditionTypeReady,
+		} {
+			setCondition(&proxy.Status.Conditions, conditionType,
+				metav1.ConditionFalse, "ValidationError", message, proxy.Generation)
+		}
+		for i := range proxy.Status.Listeners {
+			setCondition(&proxy.Status.Listeners[i].Conditions, proxyv1alpha1.ConditionTypeProgrammed,
+				metav1.ConditionFalse, "ValidationError", message, proxy.Generation)
+		}
 		if err := r.Status().Patch(ctx, &proxy, patch); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -104,6 +114,7 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if err := r.reconcileService(ctx, &proxy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
+
 	proxy.Status.PublishedRevision = revision
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
 		metav1.ConditionTrue, "ConfigPublished", "Configuration rendered to ConfigMap", proxy.Generation)
@@ -200,17 +211,15 @@ func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv
 	})
 	return err
 }
+
 func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
-	instance := proxy.Name
-	if len(instance) > maxLabelValueLen {
-		instance = instance[:maxLabelValueLen]
-	}
 	return map[string]string{
 		"app.kubernetes.io/name":       containerName,
-		"app.kubernetes.io/instance":   instance,
+		"app.kubernetes.io/instance":   proxy.Name,
 		"app.kubernetes.io/managed-by": "gateway-controller",
 	}
 }
+
 func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTemplateSpec {
 	volumes, mounts := buildVolumes(proxy)
 	gracePeriod := defaultTerminationGracePeriod
@@ -244,6 +253,7 @@ func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTem
 		},
 	}
 }
+
 func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeMount) {
 	volumes := []corev1.Volume{{
 		Name: configVolumeName,
@@ -322,6 +332,7 @@ func buildReadinessProbe(proxy *proxyv1alpha1.Proxy) *corev1.Probe {
 		FailureThreshold:    failureThreshold,
 	}
 }
+
 func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
 	ports := make([]corev1.ContainerPort, 0, len(proxy.Spec.Listeners))
 	for _, listener := range proxy.Spec.Listeners {
@@ -343,6 +354,7 @@ func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
 	}
 	return ports
 }
+
 func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
 	if len(proxy.Spec.SecretEnv) == 0 {
 		return nil
@@ -361,6 +373,7 @@ func buildEnvVars(proxy *proxyv1alpha1.Proxy) []corev1.EnvVar {
 	}
 	return envVars
 }
+
 func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1alpha1.Proxy) error {
 	desired := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
@@ -437,12 +450,14 @@ func listenerBindFamilies(bind *string) (v4, v6 bool) {
 		return false, true
 	}
 }
+
 func serviceType(proxy *proxyv1alpha1.Proxy) corev1.ServiceType {
 	if proxy.Spec.Service != nil && proxy.Spec.Service.Type != nil {
 		return corev1.ServiceType(*proxy.Spec.Service.Type)
 	}
 	return corev1.ServiceTypeClusterIP
 }
+
 func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
 	ports := make([]corev1.ServicePort, 0, len(proxy.Spec.Listeners))
 	for _, listener := range proxy.Spec.Listeners {
@@ -455,6 +470,7 @@ func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
 	}
 	return ports
 }
+
 func buildListenerStatus(proxy *proxyv1alpha1.Proxy) []proxyv1alpha1.PraxisListenerStatus {
 	existing := make(map[string][]metav1.Condition, len(proxy.Status.Listeners))
 	for _, ls := range proxy.Status.Listeners {
@@ -478,6 +494,7 @@ func buildListenerStatus(proxy *proxyv1alpha1.Proxy) []proxyv1alpha1.PraxisListe
 	}
 	return statuses
 }
+
 func (r *ProxyReconciler) updateReadyStatus(ctx context.Context, proxy *proxyv1alpha1.Proxy) error {
 	var deploy appsv1.Deployment
 	if err := r.Get(ctx, client.ObjectKeyFromObject(proxy), &deploy); err != nil {
@@ -525,6 +542,7 @@ func (r *ProxyReconciler) updateReadyStatus(ctx context.Context, proxy *proxyv1a
 	}
 	return nil
 }
+
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&proxyv1alpha1.Proxy{}).

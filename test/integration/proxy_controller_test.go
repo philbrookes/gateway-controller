@@ -113,6 +113,22 @@ var _ = Describe("Proxy Controller", func() {
 		expectValidationError(ctx, proxy, "duplicate entry name")
 	})
 
+	It("should reject duplicate entry names within a listener pipeline", func(ctx context.Context) {
+		proxy := validProxy("dup-pipeline-name")
+		proxy.Spec.FilterChains = []proxyv1alpha1.ProxyFilterChain{
+			{Name: "chain-a", Filters: []proxyv1alpha1.PraxisFilterEntry{
+				{Name: "shared", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "rate_limit"}},
+			}},
+			{Name: "chain-b", Filters: []proxyv1alpha1.PraxisFilterEntry{
+				{Name: "shared", InlineFilter: &proxyv1alpha1.PraxisInlineFilter{Type: "access_log"}},
+			}},
+		}
+		proxy.Spec.Listeners[0].FilterChains = []string{"chain-a", "chain-b"}
+		createProxy(ctx, proxy)
+
+		expectValidationError(ctx, proxy, `duplicate entry name "shared" in listener "http" pipeline`)
+	})
+
 	It("should reject terminal filter that is not last in chain", func(ctx context.Context) {
 		proxy := validProxy("terminal-not-last")
 		proxy.Spec.FilterChains = []proxyv1alpha1.ProxyFilterChain{{

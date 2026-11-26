@@ -9,12 +9,12 @@ import (
 )
 
 const (
-	maxConditionMessageLen = 32768
-	maxLabelValueLen       = 63
+	maxConditionMessageLen           = 32768
+	iterativeRequestRouterFilterType = "iterative_request_router"
 )
 
 var terminalFilterTypes = map[string]bool{
-	"iterative_request_router": true,
+	iterativeRequestRouterFilterType: true,
 }
 
 func validateProxySpec(spec *proxyv1alpha1.ProxySpec) []string {
@@ -38,11 +38,30 @@ func validateProxySpec(spec *proxyv1alpha1.ProxySpec) []string {
 	}
 
 	for listenerIdx, listener := range spec.Listeners {
+		if len(listener.FilterChains) == 0 {
+			errs = append(errs, fmt.Sprintf("spec.listeners[%d]: listener %q must reference at least one filter chain", listenerIdx, listener.Name))
+		}
+		// A listener executes its referenced chains as one flattened
+		// pipeline, so an entry name contributed by one chain may not
+		// reappear in another chain of the same listener. The set is
+		// scoped per listener: chains that no single listener references
+		// together may reuse names, and a duplicate confined to one
+		// chain is already reported by the per-chain check above.
+		pipelineEntryNames := make(map[string]string)
 		for refIdx, ref := range listener.FilterChains {
 			chain, ok := chainsByName[ref]
 			if !ok {
 				errs = append(errs, fmt.Sprintf("spec.listeners[%d]: listener %q references undefined chain %q", listenerIdx, listener.Name, ref))
 				continue
+			}
+			for _, entry := range chain.Filters {
+				if first, ok := pipelineEntryNames[entry.Name]; ok {
+					if first != chain.Name {
+						errs = append(errs, fmt.Sprintf("spec.listeners[%d]: duplicate entry name %q in listener %q pipeline (chains %q and %q)", listenerIdx, entry.Name, listener.Name, first, chain.Name))
+					}
+					continue
+				}
+				pipelineEntryNames[entry.Name] = chain.Name
 			}
 			if refIdx < len(listener.FilterChains)-1 && len(chain.Filters) > 0 {
 				last := chain.Filters[len(chain.Filters)-1]
