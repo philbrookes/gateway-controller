@@ -48,7 +48,7 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 	patch := client.MergeFrom(proxy.DeepCopy())
 
-	logger.V(1).Info("reconciling proxy")
+	logger.V(1).Info("reconciling proxy", "name", req.Name, "namespace", req.Namespace)
 
 	proxy.Status.ObservedGeneration = proxy.Generation
 
