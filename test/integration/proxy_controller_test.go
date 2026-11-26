@@ -351,7 +351,7 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
-	It("should set Programmed condition for a valid proxy", func(ctx context.Context) {
+	It("should set Programmed condition and revision for a valid proxy", func(ctx context.Context) {
 		proxy := validProxy("programmed")
 		createProxy(ctx, proxy)
 
@@ -362,6 +362,23 @@ var _ = Describe("Proxy Controller", func() {
 			gom.Expect(cond).NotTo(BeNil())
 			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
 			gom.Expect(cond.Reason).To(Equal("ConfigPublished"))
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should set ResolvedRefs and populate listener status", func(ctx context.Context) {
+		proxy := validProxy("resolved")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			gom.Expect(got.Status.Listeners).To(HaveLen(1))
+			gom.Expect(got.Status.Listeners[0].Name).To(Equal("http"))
+			gom.Expect(got.Status.Listeners[0].ChainOrder).To(Equal([]string{"main"}))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
@@ -517,15 +534,34 @@ var _ = Describe("Proxy Controller", func() {
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
+	It("should set Ready=False when deployment has no ready replicas", func(ctx context.Context) {
+		proxy := validProxy("ready-false")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeReady)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(cond.Reason).To(Equal("NoReadyReplicas"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should publish filter changes without changing the pod template", func(ctx context.Context) {
 		proxy := validProxy("update-filter")
 		createProxy(ctx, proxy)
 
 		var originalTemplate corev1.PodTemplateSpec
+		var originalRevision string
 		Eventually(func(gom Gomega, ctx context.Context) {
 			deploy := &appsv1.Deployment{}
 			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
 			originalTemplate = deploy.Spec.Template
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.PublishedRevision).NotTo(BeEmpty())
+			originalRevision = got.Status.PublishedRevision
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 
 		Eventually(func(ctx context.Context) error {
@@ -543,9 +579,103 @@ var _ = Describe("Proxy Controller", func() {
 				Name: proxy.Name + "-config", Namespace: proxy.Namespace,
 			}, cm)).To(Succeed())
 			gom.Expect(cm.Data["config.yaml"]).To(ContainSubstring("access_log"))
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.PublishedRevision).NotTo(BeEmpty())
+			gom.Expect(got.Status.PublishedRevision).NotTo(Equal(originalRevision))
 			deploy := &appsv1.Deployment{}
 			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
 			gom.Expect(deploy.Spec.Template).To(Equal(originalTemplate))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should scale replicas without changing the pod template or publication revision", func(ctx context.Context) {
+		proxy := validProxy("scale-proxy")
+		createProxy(ctx, proxy)
+		var originalTemplate corev1.PodTemplateSpec
+		var originalRevision string
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			originalTemplate = deploy.Spec.Template
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.PublishedRevision).NotTo(BeEmpty())
+			originalRevision = got.Status.PublishedRevision
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.Replicas = new(int32(3))
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+		Eventually(func(gom Gomega, ctx context.Context) {
+			deploy := &appsv1.Deployment{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), deploy)).To(Succeed())
+			gom.Expect(deploy.Spec.Replicas).To(HaveValue(Equal(int32(3))))
+			gom.Expect(deploy.Spec.Template).To(Equal(originalTemplate))
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+			gom.Expect(got.Status.PublishedRevision).To(Equal(originalRevision))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should update Service type when spec.service.type changes", func(ctx context.Context) {
+		proxy := validProxy("update-svc-type")
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeClusterIP))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			nodePort := proxyv1alpha1.ServiceType(corev1.ServiceTypeNodePort)
+			got.Spec.Service = &proxyv1alpha1.ProxyService{Type: &nodePort}
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
+	It("should update revision when spec.image changes", func(ctx context.Context) {
+		proxy := validProxy("rev-image")
+		createProxy(ctx, proxy)
+
+		var origRevision string
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+			origRevision = got.Status.DesiredRevision
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.Image = "ghcr.io/praxis-proxy/praxis:v2"
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			gom.Expect(got.Status.DesiredRevision).NotTo(BeEmpty())
+			gom.Expect(got.Status.DesiredRevision).NotTo(Equal(origRevision))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 

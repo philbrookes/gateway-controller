@@ -10,6 +10,12 @@ Listener, admin, and insecure-option changes trigger a rollout. Replica changes
 scale the Deployment without restarting existing pods. To roll back configuration,
 restore the Proxy spec; a Deployment rollback leaves the live ConfigMap unchanged.
 
+`Ready` and `servingReplicas` describe Deployment readiness. `publishedRevision`
+records completed configuration and workload writes; it does not confirm that each
+pod has reloaded the configuration. Bad configuration at startup prevents the
+pod becoming ready. A failed hot reload leaves Praxis serving its previous
+configuration.
+
 ## Policy filter references
 
 Policy filter references render to the native policy filter: the controller

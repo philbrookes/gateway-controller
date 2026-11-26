@@ -630,8 +630,9 @@ spec:
                   type: string
                 type: array
               conditions:
-                description: conditions report Accepted, ResolvedRefs, Programmed,
-                  and Ready.
+                description: |-
+                  conditions report Accepted, ResolvedRefs, Programmed, and Ready.
+                  Ready reports desired workload readiness, not acknowledgement of a config reload.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -691,8 +692,8 @@ spec:
                 - type
                 x-kubernetes-list-type: map
               desiredRevision:
-                description: desiredRevision is a digest of the complete desired config
-                  and inputs.
+                description: desiredRevision identifies the rendered config and runtime
+                  image/environment inputs.
                 type: string
               listeners:
                 description: listeners reports per-listener results and assembled
@@ -781,12 +782,14 @@ spec:
                 format: int64
                 type: integer
               publishedRevision:
-                description: publishedRevision is the revision successfully written
-                  for this proxy.
+                description: |-
+                  publishedRevision identifies the config and workload successfully written for this proxy.
+                  It does not acknowledge that running processes have reloaded the config.
                 type: string
               servingReplicas:
-                description: servingReplicas is the number of replicas confirmed to
-                  serve desiredRevision.
+                description: |-
+                  servingReplicas is the number of ready replicas reported by the Deployment.
+                  It does not confirm that those replicas have loaded desiredRevision.
                 format: int32
                 type: integer
             type: object

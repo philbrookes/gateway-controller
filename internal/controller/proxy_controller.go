@@ -8,6 +8,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -82,6 +83,12 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		"policyDocuments", len(rendered.PolicyDocuments))
 	configData := rendered.Config
 
+	revision, err := computeRevision(configData, proxy.Spec.Image, proxy.Spec.SecretEnv)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	proxy.Status.DesiredRevision = revision
+
 	if err := r.reconcileConfigMap(ctx, &proxy, configData); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile configmap: %w", err)
 	}
@@ -97,8 +104,14 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if err := r.reconcileService(ctx, &proxy); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
+	proxy.Status.PublishedRevision = revision
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
 		metav1.ConditionTrue, "ConfigPublished", "Configuration rendered to ConfigMap", proxy.Generation)
+
+	proxy.Status.Listeners = buildListenerStatus(&proxy)
+	if err := r.updateReadyStatus(ctx, &proxy); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	if err := r.Status().Patch(ctx, &proxy, patch); err != nil {
 		return ctrl.Result{}, err
@@ -441,6 +454,76 @@ func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
 		})
 	}
 	return ports
+}
+func buildListenerStatus(proxy *proxyv1alpha1.Proxy) []proxyv1alpha1.PraxisListenerStatus {
+	existing := make(map[string][]metav1.Condition, len(proxy.Status.Listeners))
+	for _, ls := range proxy.Status.Listeners {
+		existing[ls.Name] = ls.Conditions
+	}
+	statuses := make([]proxyv1alpha1.PraxisListenerStatus, 0, len(proxy.Spec.Listeners))
+	for _, listener := range proxy.Spec.Listeners {
+		ls := proxyv1alpha1.PraxisListenerStatus{
+			Name:       listener.Name,
+			ChainOrder: listener.FilterChains,
+			Conditions: existing[listener.Name],
+		}
+		apimeta.SetStatusCondition(&ls.Conditions, metav1.Condition{
+			Type:               proxyv1alpha1.ConditionTypeProgrammed,
+			Status:             metav1.ConditionTrue,
+			Reason:             "Programmed",
+			Message:            fmt.Sprintf("Listener %q programmed", listener.Name),
+			ObservedGeneration: proxy.Generation,
+		})
+		statuses = append(statuses, ls)
+	}
+	return statuses
+}
+func (r *ProxyReconciler) updateReadyStatus(ctx context.Context, proxy *proxyv1alpha1.Proxy) error {
+	var deploy appsv1.Deployment
+	if err := r.Get(ctx, client.ObjectKeyFromObject(proxy), &deploy); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return fmt.Errorf("get deployment: %w", err)
+		}
+		proxy.Status.ServingReplicas = 0
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeReady,
+			metav1.ConditionFalse, "NoReadyReplicas", "Deployment not found", proxy.Generation)
+		return nil
+	}
+	proxy.Status.ServingReplicas = deploy.Status.ReadyReplicas
+
+	desired := int32(1)
+	if proxy.Spec.Replicas != nil {
+		desired = *proxy.Spec.Replicas
+	}
+	startupRevision, err := computeStartupRevision(&proxy.Spec)
+	if err != nil {
+		return err
+	}
+	rolloutComplete := deploy.Spec.Replicas != nil && *deploy.Spec.Replicas == desired &&
+		deploy.Spec.Template.Annotations[startupRevisionAnnotation] == startupRevision &&
+		deploy.Status.ObservedGeneration >= deploy.Generation &&
+		deploy.Status.UpdatedReplicas == desired &&
+		deploy.Status.ReadyReplicas == desired &&
+		deploy.Status.UnavailableReplicas == 0
+
+	switch {
+	case rolloutComplete:
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeReady,
+			metav1.ConditionTrue, "DeploymentReady",
+			fmt.Sprintf("%d/%d replicas ready", deploy.Status.ReadyReplicas, desired),
+			proxy.Generation)
+	case deploy.Status.ReadyReplicas == 0:
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeReady,
+			metav1.ConditionFalse, "NoReadyReplicas",
+			fmt.Sprintf("0/%d replicas ready", desired),
+			proxy.Generation)
+	default:
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeReady,
+			metav1.ConditionFalse, "RollingOut",
+			fmt.Sprintf("%d/%d updated, %d/%d ready", deploy.Status.UpdatedReplicas, desired, deploy.Status.ReadyReplicas, desired),
+			proxy.Generation)
+	}
+	return nil
 }
 func (r *ProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).

@@ -176,15 +176,17 @@ type ProxyStatus struct {
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// desiredRevision is a digest of the complete desired config and inputs.
+	// desiredRevision identifies the rendered config and runtime image/environment inputs.
 	// +optional
 	DesiredRevision string `json:"desiredRevision,omitempty"`
 
-	// publishedRevision is the revision successfully written for this proxy.
+	// publishedRevision identifies the config and workload successfully written for this proxy.
+	// It does not acknowledge that running processes have reloaded the config.
 	// +optional
 	PublishedRevision string `json:"publishedRevision,omitempty"`
 
-	// servingReplicas is the number of replicas confirmed to serve desiredRevision.
+	// servingReplicas is the number of ready replicas reported by the Deployment.
+	// It does not confirm that those replicas have loaded desiredRevision.
 	// +optional
 	ServingReplicas int32 `json:"servingReplicas,omitempty"`
 
@@ -197,6 +199,7 @@ type ProxyStatus struct {
 	AvailableFilters []string `json:"availableFilters,omitempty"`
 
 	// conditions report Accepted, ResolvedRefs, Programmed, and Ready.
+	// Ready reports desired workload readiness, not acknowledgement of a config reload.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
