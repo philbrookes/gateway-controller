@@ -7,6 +7,7 @@ import (
 	"maps"
 	"net"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -355,6 +356,39 @@ func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1a
 	return rendered, nil
 }
 
+// reservedFilterConfigKeys are the rendered filter entry keys the
+// controller owns: the entry's identity and wiring, set from the typed
+// API fields (name, filter, failure_mode, conditions,
+// response_conditions) or the policy reference (config_path). The
+// inline Config is copied over the rendered entry, so a key set there
+// would override or impersonate the controller-rendered field; inline
+// configs setting one are rejected, while ordinary filter
+// configuration keys keep flattening.
+var reservedFilterConfigKeys = []string{
+	"conditions",
+	"config_path",
+	"failure_mode",
+	"filter",
+	"name",
+	"response_conditions",
+}
+
+// rejectReservedFilterConfigKeys returns an error naming every
+// controller-owned key the inline filter configuration sets.
+func rejectReservedFilterConfigKeys(entry *proxyv1alpha1.PraxisFilterEntry, config map[string]any) error {
+	var reserved []string
+	for _, key := range reservedFilterConfigKeys {
+		if _, ok := config[key]; ok {
+			reserved = append(reserved, strconv.Quote(key))
+		}
+	}
+	if len(reserved) == 0 {
+		return nil
+	}
+	return fmt.Errorf("filter %q: inline config sets reserved keys %s, which the controller renders from the filter entry's fields",
+		entry.Name, strings.Join(reserved, ", "))
+}
+
 func renderFilterEntry(ctx context.Context, reader client.Reader, entry *proxyv1alpha1.PraxisFilterEntry, namespace string, policyDocuments map[string]string) (map[string]any, error) {
 	filter := map[string]any{"name": entry.Name}
 
@@ -366,9 +400,10 @@ func renderFilterEntry(ctx context.Context, reader client.Reader, entry *proxyv1
 			if err := json.Unmarshal(entry.InlineFilter.Config.Raw, &configMap); err != nil {
 				return nil, fmt.Errorf("unmarshal inline config: %w", err)
 			}
+			if err := rejectReservedFilterConfigKeys(entry, configMap); err != nil {
+				return nil, err
+			}
 			maps.Copy(filter, configMap)
-			filter["name"] = entry.Name
-			filter["filter"] = entry.InlineFilter.Type
 		}
 	case isPolicyRef(entry.Ref):
 		policy, err := resolvePolicy(ctx, reader, entry.Ref, namespace)

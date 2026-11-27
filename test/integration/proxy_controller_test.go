@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -436,6 +437,37 @@ var _ = Describe("Proxy Controller", func() {
 
 		expectValidationError(ctx, proxy, "duplicate entry name")
 
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      proxy.Name + "-config",
+			Namespace: proxy.Namespace,
+		}, cm)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("reports a render error when inline config sets a reserved key", func(ctx context.Context) {
+		proxy := validProxy("reserved-config")
+		// The inline Config is copied over the rendered filter entry, so
+		// a controller-owned key would override the field rendered from
+		// the typed spec; the controller must reject it instead.
+		proxy.Spec.FilterChains[0].Filters[0].InlineFilter.Config =
+			&runtime.RawExtension{Raw: []byte(`{"filter":"evil","burst":200}`)}
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			accepted := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted)
+			gom.Expect(accepted).NotTo(BeNil())
+			gom.Expect(accepted.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(accepted.Reason).To(Equal("ConfigRenderError"))
+			gom.Expect(accepted.Message).To(ContainSubstring(`reserved keys "filter"`))
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionFalse))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// The conflicting spec must not publish anything.
 		cm := &corev1.ConfigMap{}
 		err := k8sClient.Get(ctx, types.NamespacedName{
 			Name:      proxy.Name + "-config",

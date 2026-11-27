@@ -152,40 +152,87 @@ func TestRenderProxyConfig_ListenerTLS(t *testing.T) {
 	}
 }
 
-func TestRenderProxyConfig_ReservedKeysProtected(t *testing.T) {
+func TestRenderProxyConfig_ReservedConfigKeys(t *testing.T) {
 	t.Parallel()
-	spec := &proxyv1alpha1.ProxySpec{
-		Image: "ghcr.io/praxis-proxy/praxis:latest",
-		FilterChains: []proxyv1alpha1.ProxyFilterChain{{
-			Name: "main",
-			Filters: []proxyv1alpha1.PraxisFilterEntry{{
-				Name: "rl",
-				InlineFilter: &proxyv1alpha1.PraxisInlineFilter{
-					Type:   "rate_limiter",
-					Config: &runtime.RawExtension{Raw: []byte(`{"name":"evil","filter":"evil","burst":200}`)},
-				},
+
+	// inlineSpec returns a minimal valid spec whose single inline filter
+	// carries the given raw JSON configuration.
+	inlineSpec := func(config string) *proxyv1alpha1.ProxySpec {
+		return &proxyv1alpha1.ProxySpec{
+			Image: "ghcr.io/praxis-proxy/praxis:latest",
+			FilterChains: []proxyv1alpha1.ProxyFilterChain{{
+				Name: "main",
+				Filters: []proxyv1alpha1.PraxisFilterEntry{{
+					Name: "rl",
+					InlineFilter: &proxyv1alpha1.PraxisInlineFilter{
+						Type:   "rate_limiter",
+						Config: &runtime.RawExtension{Raw: []byte(config)},
+					},
+				}},
 			}},
-		}},
-		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080, FilterChains: []string{"main"}}},
+			Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080, FilterChains: []string{"main"}}},
+		}
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+
+	// The inline Config is copied over the rendered filter entry, so
+	// these keys would override or impersonate the fields the controller
+	// renders from the typed spec — every controller-owned key must be
+	// rejected, not just the ones the entry happens to set.
+	for _, key := range []string{
+		"name", "filter", "failure_mode", "conditions", "response_conditions", "config_path",
+	} {
+		t.Run("rejects inline config setting "+key, func(t *testing.T) {
+			t.Parallel()
+			config := fmt.Sprintf(`{%q:"evil"}`, key)
+			_, err := renderProxyConfig(t.Context(), newRenderReader(t), inlineSpec(config), "default", "")
+			if err == nil {
+				t.Fatalf("inline config setting %q must be rejected", key)
+			}
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error must name the reserved key %q, got: %v", key, err)
+			}
+			if !strings.Contains(err.Error(), `"rl"`) {
+				t.Errorf("error must name the filter entry, got: %v", err)
+			}
+		})
 	}
-	var parsed nativeConfig
-	if err := yaml.Unmarshal([]byte(got.Config), &parsed); err != nil {
-		t.Fatalf("invalid YAML: %v", err)
-	}
-	filter := parsed.FilterChains[0].Filters[0]
-	if filter["name"] != "rl" {
-		t.Errorf("name should be protected, got: %v", filter["name"])
-	}
-	if filter["filter"] != "rate_limiter" {
-		t.Errorf("filter type should be protected, got: %v", filter["filter"])
-	}
-	if v, ok := filter["burst"]; !ok || v != float64(200) {
-		t.Errorf("non-reserved key should still be flattened, burst: %v", v)
-	}
+
+	t.Run("names every offending key", func(t *testing.T) {
+		t.Parallel()
+		_, err := renderProxyConfig(t.Context(), newRenderReader(t),
+			inlineSpec(`{"name":"evil","filter":"evil"}`), "default", "")
+		if err == nil {
+			t.Fatal("inline config setting reserved keys must be rejected")
+		}
+		for _, key := range []string{`"name"`, `"filter"`} {
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error must name reserved key %s, got: %v", key, err)
+			}
+		}
+	})
+
+	t.Run("keeps flattening ordinary filter configuration keys", func(t *testing.T) {
+		t.Parallel()
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t),
+			inlineSpec(`{"requests_per_second":100,"burst":200}`), "default", "")
+		if err != nil {
+			t.Fatalf("ordinary configuration keys must keep flattening: %v", err)
+		}
+		var parsed nativeConfig
+		if err := yaml.Unmarshal([]byte(got.Config), &parsed); err != nil {
+			t.Fatalf("invalid YAML: %v", err)
+		}
+		filter := parsed.FilterChains[0].Filters[0]
+		if filter["name"] != "rl" || filter["filter"] != "rate_limiter" {
+			t.Errorf("controller-rendered keys must stay authoritative, got: %v", filter)
+		}
+		if v, ok := filter["burst"]; !ok || v != float64(200) {
+			t.Errorf("ordinary key must still be flattened, burst: %v", v)
+		}
+		if v, ok := filter["requests_per_second"]; !ok || v != float64(100) {
+			t.Errorf("ordinary key must still be flattened, requests_per_second: %v", v)
+		}
+	})
 }
 
 func TestRenderProxyConfig_InlineFilter(t *testing.T) {
