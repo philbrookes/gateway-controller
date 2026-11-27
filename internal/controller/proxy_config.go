@@ -181,9 +181,12 @@ func renderListenerTLS(listener *proxyv1alpha1.PraxisListener) *nativeTLS {
 
 // readinessFilterChain returns the health-only filter chain the
 // readiness listener executes. The Praxis validator rejects chainless
-// HTTP listeners — filter_chains may only be omitted on protocol: tcp
-// listeners, which must instead route via upstream or cluster — so the
-// readiness listener carries this dedicated chain. Its single
+// HTTP listeners ("at least one filter chain required for HTTP
+// listeners"; filter_chains may only be omitted on protocol: tcp
+// listeners, which must instead route via upstream or cluster), so the
+// readiness listener carries this dedicated chain. Verified against
+// the release pinned in config/samples/proxy/proxy.yaml, which accepts
+// the rendered form and rejects the chainless one. Its single
 // static_response filter is the form the Praxis configuration reference
 // documents for health checks: it answers with a fixed response without
 // contacting any upstream, so no application traffic can be routed
