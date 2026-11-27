@@ -168,14 +168,24 @@ func readinessPort(spec *proxyv1alpha1.ProxySpec) int32 {
 
 // renderListenerTLS returns the native TLS config for a listener's
 // certificate, which the controller's Deployment mounts under the
-// listener's TLS directory.
+// listener's TLS directory. The Praxis release pinned in
+// config/samples/proxy/proxy.yaml loads certificates as a list — a
+// flat cert_path/key_path pair on the tls block is rejected at startup
+// ("unknown field `cert_path`, expected one of `certificates`,
+// cipher_suites, client_ca, client_cert_mode, trusted_spiffe_ids,
+// hot_reload, min_version") — so the mounted pair renders as the
+// single entry of the certificates list. Verified against that
+// release with a live, CA-verified TLS request through a listener
+// configured with this form.
 func renderListenerTLS(listener *proxyv1alpha1.PraxisListener) *nativeTLS {
 	if listener.TLS == nil {
 		return nil
 	}
 	return &nativeTLS{
-		CertPath: fmt.Sprintf("%s/%s/tls.crt", tlsMountPrefix, listener.Name),
-		KeyPath:  fmt.Sprintf("%s/%s/tls.key", tlsMountPrefix, listener.Name),
+		Certificates: []nativeTLSCertificate{{
+			CertPath: fmt.Sprintf("%s/%s/tls.crt", tlsMountPrefix, listener.Name),
+			KeyPath:  fmt.Sprintf("%s/%s/tls.key", tlsMountPrefix, listener.Name),
+		}},
 	}
 }
 
@@ -261,6 +271,13 @@ type nativeListener struct {
 }
 
 type nativeTLS struct {
+	Certificates []nativeTLSCertificate `json:"certificates"`
+}
+
+// nativeTLSCertificate is one entry of a listener's certificates list:
+// the certificate chain and private key the runtime loads, mounted by
+// the controller's Deployment from the referenced Secret.
+type nativeTLSCertificate struct {
 	CertPath string `json:"cert_path"`
 	KeyPath  string `json:"key_path"`
 }

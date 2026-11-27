@@ -152,11 +152,51 @@ func TestRenderProxyConfig_ListenerTLS(t *testing.T) {
 	if listener.TLS == nil {
 		t.Fatal("expected TLS config")
 	}
-	if listener.TLS.CertPath != "/etc/praxis/tls/https/tls.crt" {
-		t.Errorf("cert_path: %s", listener.TLS.CertPath)
+	// Pin the TLS wire format: the Praxis release pinned in
+	// config/samples/proxy/proxy.yaml rejects a flat cert_path/key_path
+	// pair on the listener's tls block ("unknown field `cert_path`,
+	// expected one of `certificates`, ...") and crashes at startup, so
+	// the certificate must render as the certificates list the runtime
+	// loads. Verified against that release with a live, CA-verified
+	// TLS request through a listener configured with this form.
+	var raw map[string]any
+	if err := yaml.Unmarshal([]byte(got.Config), &raw); err != nil {
+		t.Fatalf("invalid YAML: %v", err)
 	}
-	if listener.TLS.KeyPath != "/etc/praxis/tls/https/tls.key" {
-		t.Errorf("key_path: %s", listener.TLS.KeyPath)
+	rawListeners, ok := raw["listeners"].([]any)
+	if !ok || len(rawListeners) < 1 {
+		t.Fatalf("listeners = %#v, want at least one", raw["listeners"])
+	}
+	var https map[string]any
+	for _, l := range rawListeners {
+		listener, ok := l.(map[string]any)
+		if !ok {
+			continue
+		}
+		if listener["name"] == "https" {
+			https = listener
+		}
+	}
+	if https == nil {
+		t.Fatalf("listeners = %#v, want one named https", raw["listeners"])
+	}
+	tlsBlock, ok := https["tls"].(map[string]any)
+	if !ok {
+		t.Fatalf("listener tls block = %#v, want an object", rawListeners[0])
+	}
+	certificates, ok := tlsBlock["certificates"].([]any)
+	if !ok || len(certificates) != 1 {
+		t.Fatalf("tls.certificates = %#v, want one entry", tlsBlock["certificates"])
+	}
+	certificate, ok := certificates[0].(map[string]any)
+	if !ok {
+		t.Fatalf("tls.certificates[0] = %#v, want an object", certificates[0])
+	}
+	if certificate["cert_path"] != "/etc/praxis/tls/https/tls.crt" {
+		t.Errorf("tls.certificates[0].cert_path = %v, want /etc/praxis/tls/https/tls.crt", certificate["cert_path"])
+	}
+	if certificate["key_path"] != "/etc/praxis/tls/https/tls.key" {
+		t.Errorf("tls.certificates[0].key_path = %v, want /etc/praxis/tls/https/tls.key", certificate["key_path"])
 	}
 }
 
@@ -1033,11 +1073,14 @@ func TestRenderProxyConfig_ReadinessListener(t *testing.T) {
 		if readiness.TLS == nil {
 			t.Fatal("readiness listener must preserve the first listener's TLS")
 		}
-		if readiness.TLS.CertPath != "/etc/praxis/tls/http/tls.crt" {
-			t.Errorf("readiness listener cert_path: %s", readiness.TLS.CertPath)
+		if len(readiness.TLS.Certificates) != 1 {
+			t.Fatalf("readiness listener certificates = %+v, want one", readiness.TLS.Certificates)
 		}
-		if readiness.TLS.KeyPath != "/etc/praxis/tls/http/tls.key" {
-			t.Errorf("readiness listener key_path: %s", readiness.TLS.KeyPath)
+		if readiness.TLS.Certificates[0].CertPath != "/etc/praxis/tls/http/tls.crt" {
+			t.Errorf("readiness listener cert_path: %s", readiness.TLS.Certificates[0].CertPath)
+		}
+		if readiness.TLS.Certificates[0].KeyPath != "/etc/praxis/tls/http/tls.key" {
+			t.Errorf("readiness listener key_path: %s", readiness.TLS.Certificates[0].KeyPath)
 		}
 		if len(readiness.FilterChains) != 1 || readiness.FilterChains[0] != "readiness" {
 			t.Errorf("readiness listener must reference its dedicated health-only chain, got: %v", readiness.FilterChains)
