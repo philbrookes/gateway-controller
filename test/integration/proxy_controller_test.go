@@ -964,6 +964,39 @@ var _ = Describe("Proxy Controller", func() {
 			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
 			gom.Expect(svc.Spec.Type).To(Equal(corev1.ServiceTypeNodePort))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// The API server allocated a node port for the listener. A later
+		// spec change rebuilds the Service port list; the allocated
+		// node port must follow the port by name instead of being
+		// dropped for a fresh allocation, or clients of the node port
+		// lose their endpoint on every reconcile that touches ports.
+		var allocatedNodePort int32
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.Ports).To(HaveLen(1))
+			gom.Expect(svc.Spec.Ports[0].NodePort).NotTo(Equal(int32(0)))
+			allocatedNodePort = svc.Spec.Ports[0].NodePort
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		Eventually(func(ctx context.Context) error {
+			got := &proxyv1alpha1.Proxy{}
+			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got); err != nil {
+				return err
+			}
+			got.Spec.Listeners[0].Port = got.Spec.Listeners[0].Port + 1
+			return k8sClient.Update(ctx, got)
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// The port number moving proves the reconcile ran; the node
+		// port staying proves the allocation was carried across it.
+		Eventually(func(gom Gomega, ctx context.Context) {
+			svc := &corev1.Service{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), svc)).To(Succeed())
+			gom.Expect(svc.Spec.Ports).To(HaveLen(1))
+			gom.Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8081)))
+			gom.Expect(svc.Spec.Ports[0].NodePort).To(Equal(allocatedNodePort))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
 	It("should update revision when spec.image changes", func(ctx context.Context) {

@@ -532,7 +532,22 @@ func (r *ProxyReconciler) reconcileService(ctx context.Context, proxy *proxyv1al
 		}
 		desired.Spec.Selector = proxyLabels(proxy)
 		desired.Spec.Type = serviceType(proxy)
+		// On update, CreateOrUpdate has already fetched the stored
+		// Service into desired, so its ports still carry the node
+		// ports the API server allocated. Capture them before the
+		// rebuild — a desired port list without them differs from the
+		// stored Service on every reconcile and leans on the API
+		// server's update-time stickiness to keep the allocation —
+		// and carry them onto the rebuilt ports with matching names
+		// while the desired type still allocates node ports. Leaving
+		// the NodePort type (or never having used it) rebuilds the
+		// ports unallocated, which clears node ports the API server
+		// rejects on a ClusterIP Service.
+		allocated := nodePortsByName(desired.Spec.Ports)
 		desired.Spec.Ports = buildServicePorts(proxy)
+		if serviceTypeAllocatesNodePorts(desired.Spec.Type) {
+			retainNodePorts(desired.Spec.Ports, allocated)
+		}
 		families, familyPolicy := serviceIPFamilies(proxy)
 		desired.Spec.IPFamilyPolicy = &familyPolicy
 		// A nil family list asks the API server to allocate what the
@@ -703,6 +718,37 @@ func buildServicePorts(proxy *proxyv1alpha1.Proxy) []corev1.ServicePort {
 		})
 	}
 	return ports
+}
+
+// serviceTypeAllocatesNodePorts reports whether the API server
+// allocates node ports for Services of the type.
+func serviceTypeAllocatesNodePorts(serviceType corev1.ServiceType) bool {
+	return serviceType == corev1.ServiceTypeNodePort || serviceType == corev1.ServiceTypeLoadBalancer
+}
+
+// nodePortsByName maps port name to the node port the API server
+// allocated for it.
+func nodePortsByName(ports []corev1.ServicePort) map[string]int32 {
+	allocated := make(map[string]int32, len(ports))
+	for _, port := range ports {
+		if port.NodePort > 0 {
+			allocated[port.Name] = port.NodePort
+		}
+	}
+	return allocated
+}
+
+// retainNodePorts carries allocated node ports onto rebuilt ports with
+// matching names, keeping the allocations stable across reconciles.
+// Ports without a matching allocation — added or renamed listeners, or
+// a switch to a type without node ports — stay unallocated for the API
+// server to assign or clear.
+func retainNodePorts(ports []corev1.ServicePort, allocated map[string]int32) {
+	for i := range ports {
+		if nodePort, ok := allocated[ports[i].Name]; ok {
+			ports[i].NodePort = nodePort
+		}
+	}
 }
 
 func buildListenerStatus(proxy *proxyv1alpha1.Proxy) []proxyv1alpha1.PraxisListenerStatus {

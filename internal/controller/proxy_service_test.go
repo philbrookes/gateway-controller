@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -13,9 +14,11 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 )
@@ -430,4 +433,134 @@ func TestReconcileProxy_MixedBindsReconcileIdempotently(t *testing.T) {
 	if svc.Spec.IPFamilyPolicy == nil || *svc.Spec.IPFamilyPolicy != corev1.IPFamilyPolicyPreferDualStack {
 		t.Errorf("family policy = %v, want PreferDualStack", svc.Spec.IPFamilyPolicy)
 	}
+}
+
+// TestReconcileService_RetainsAllocatedNodePorts pins the node-port
+// half of Service reconciliation: rebuilding the port list from the
+// proxy must not drop the node ports the API server allocated for
+// ports that still exist, because a desired object without them
+// differs from the stored Service on every reconcile and relies on the
+// API server's update-time stickiness to keep the allocation.
+func TestReconcileService_RetainsAllocatedNodePorts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	nodePortType := proxyv1alpha1.ServiceType(corev1.ServiceTypeNodePort)
+	proxy := guardTestProxy()
+	proxy.Spec.Service = &proxyv1alpha1.ProxyService{Type: &nodePortType}
+	svc := nodePortServiceFor(proxy, 31234)
+
+	var serviceUpdates atomic.Int32
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithObjects(proxy, svc).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+				if _, ok := obj.(*corev1.Service); ok {
+					serviceUpdates.Add(1)
+				}
+				return c.Update(ctx, obj, opts...)
+			},
+		}).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileService(ctx, proxy); err != nil {
+		t.Fatalf("reconcile service: %v", err)
+	}
+	if nodePort := storedNodePort(t, cl, proxy); nodePort != 31234 {
+		t.Errorf("nodePort = %d, want the allocated 31234 retained on port %q", nodePort, "http")
+	}
+
+	// The steady state: an unchanged reconcile keeps the allocation
+	// and performs no Service write at all.
+	serviceUpdates.Store(0)
+	if err := r.reconcileService(ctx, proxy); err != nil {
+		t.Fatalf("second reconcile service: %v", err)
+	}
+	if nodePort := storedNodePort(t, cl, proxy); nodePort != 31234 {
+		t.Errorf("nodePort after the unchanged reconcile = %d, want the allocated 31234 retained", nodePort)
+	}
+	if serviceUpdates.Load() != 0 {
+		t.Errorf("unchanged reconcile sent %d Service update requests, want 0", serviceUpdates.Load())
+	}
+}
+
+// TestReconcileService_ClearsNodePortsWhenLeavingNodePortType pins the
+// other half: a Service whose proxy no longer asks for a type that
+// allocates node ports must lose them, because the API server rejects
+// node ports on a ClusterIP Service.
+func TestReconcileService_ClearsNodePortsWhenLeavingNodePortType(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	proxy := guardTestProxy()
+	svc := nodePortServiceFor(proxy, 31234)
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(proxy, svc).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+
+	if err := r.reconcileService(ctx, proxy); err != nil {
+		t.Fatalf("reconcile service: %v", err)
+	}
+	got := &corev1.Service{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(svc), got); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	if got.Spec.Type != corev1.ServiceTypeClusterIP {
+		t.Errorf("service type = %s, want ClusterIP for the defaulted spec", got.Spec.Type)
+	}
+	if nodePort := storedNodePort(t, cl, proxy); nodePort != 0 {
+		t.Errorf("nodePort = %d, want it cleared for the ClusterIP type", nodePort)
+	}
+}
+
+// nodePortServiceFor builds the Service the cluster holds for a proxy
+// whose single listener has an allocated node port: controller-owned,
+// NodePort type, and the exact form reconcileService produces.
+func nodePortServiceFor(proxy *proxyv1alpha1.Proxy, nodePort int32) *corev1.Service {
+	singleStack := corev1.IPFamilyPolicySingleStack
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      proxy.Name,
+			Namespace: proxy.Namespace,
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion:         "praxis.io/v1alpha1",
+				Kind:               "Proxy",
+				Name:               proxy.Name,
+				UID:                proxy.UID,
+				Controller:         new(true),
+				BlockOwnerDeletion: new(true),
+			}},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: proxyLabels(proxy),
+			Type:     corev1.ServiceTypeNodePort,
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Port:       8080,
+				TargetPort: intstr.FromString("http"),
+				Protocol:   corev1.ProtocolTCP,
+				NodePort:   nodePort,
+			}},
+			IPFamilies:     []corev1.IPFamily{corev1.IPv4Protocol},
+			IPFamilyPolicy: &singleStack,
+		},
+	}
+}
+
+func storedNodePort(t *testing.T, cl client.Client, proxy *proxyv1alpha1.Proxy) int32 {
+	t.Helper()
+	svc := &corev1.Service{}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(proxy), svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	for _, port := range svc.Spec.Ports {
+		if port.Name == "http" {
+			return port.NodePort
+		}
+	}
+	t.Fatalf("service ports %+v have no port %q", svc.Spec.Ports, "http")
+	return 0
 }
