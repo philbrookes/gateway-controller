@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,15 @@ const (
 	// volumeDefaultMode mirrors the mode the API server defaults
 	// ConfigMap and Secret volumes to when it is left unset.
 	volumeDefaultMode = 0o644
+	// tlsCertificateKey and tlsPrivateKeyKey are the keys a
+	// kubernetes.io/tls Secret carries; the Deployment mounts them at
+	// the paths the rendered config points Praxis at.
+	tlsCertificateKey = "tls.crt"
+	tlsPrivateKeyKey  = "tls.key"
+	// unresolvedRefRequeueInterval polls for referenced objects that do
+	// not exist yet: referenced Secrets are not owned by the proxy, so
+	// their creation does not trigger a reconcile.
+	unresolvedRefRequeueInterval = 30 * time.Second
 )
 
 type ProxyReconciler struct {
@@ -39,6 +49,7 @@ type ProxyReconciler struct {
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=praxis.io,resources=proxies/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=praxis.io,resources=policies,verbs=get;list;watch
@@ -102,6 +113,26 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 			return ctrl.Result{}, patchErr
 		}
 		return ctrl.Result{}, nil
+	}
+
+	// Reference resolution completes before anything is published.
+	// Rendering resolved the policy references — their documents are
+	// part of the rendered config — and the Secrets the Deployment
+	// mounts and projects are resolved here. An unresolved reference
+	// is reported in status rather than published as a pod that can
+	// never start: the Deployment would block on a missing Secret
+	// volume or env key. Referenced Secrets are not owned by the
+	// proxy, so their creation cannot trigger a reconcile; the
+	// unresolved path requeues to poll for them.
+	if unresolved := r.resolveReferences(ctx, &proxy); len(unresolved) > 0 {
+		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
+			metav1.ConditionFalse, "UnresolvedRefs",
+			truncateToRuneBoundary(strings.Join(unresolved, "; "), maxConditionMessageLen),
+			proxy.Generation)
+		if patchErr := r.Status().Patch(ctx, &proxy, patch); patchErr != nil {
+			return ctrl.Result{}, patchErr
+		}
+		return ctrl.Result{RequeueAfter: unresolvedRefRequeueInterval}, nil
 	}
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
 		metav1.ConditionTrue, "ResolvedRefs", "All references resolved", proxy.Generation)
@@ -170,6 +201,53 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// resolveReferences reports the spec references that do not resolve
+// against the cluster: the TLS certificate Secret each listener mounts
+// and the Secret keys projected as environment variables. Policy
+// references are resolved while rendering the configuration, because
+// their documents are part of the rendered config. An empty return
+// means every reference resolves — trivially so for inline-only
+// proxies, which reference nothing.
+func (r *ProxyReconciler) resolveReferences(ctx context.Context, proxy *proxyv1alpha1.Proxy) []string {
+	var unresolved []string
+	for i := range proxy.Spec.Listeners {
+		listener := &proxy.Spec.Listeners[i]
+		if listener.TLS == nil {
+			continue
+		}
+		name := listener.TLS.CertificateRef.Name
+		secret := &corev1.Secret{}
+		err := r.Get(ctx, client.ObjectKey{Namespace: proxy.Namespace, Name: name}, secret)
+		switch {
+		case apierrors.IsNotFound(err):
+			unresolved = append(unresolved, fmt.Sprintf("listener %q: TLS certificate secret %q not found", listener.Name, name))
+		case err != nil:
+			unresolved = append(unresolved, fmt.Sprintf("listener %q: get TLS certificate secret %q: %v", listener.Name, name, err))
+		default:
+			for _, key := range []string{tlsCertificateKey, tlsPrivateKeyKey} {
+				if _, ok := secret.Data[key]; !ok {
+					unresolved = append(unresolved, fmt.Sprintf("listener %q: TLS certificate secret %q lacks key %q", listener.Name, name, key))
+				}
+			}
+		}
+	}
+	for _, env := range proxy.Spec.SecretEnv {
+		secret := &corev1.Secret{}
+		err := r.Get(ctx, client.ObjectKey{Namespace: proxy.Namespace, Name: env.SecretRef.Name}, secret)
+		switch {
+		case apierrors.IsNotFound(err):
+			unresolved = append(unresolved, fmt.Sprintf("secretEnv %q: secret %q not found", env.Name, env.SecretRef.Name))
+		case err != nil:
+			unresolved = append(unresolved, fmt.Sprintf("secretEnv %q: get secret %q: %v", env.Name, env.SecretRef.Name, err))
+		default:
+			if _, ok := secret.Data[env.SecretRef.Key]; !ok {
+				unresolved = append(unresolved, fmt.Sprintf("secretEnv %q: secret %q lacks key %q", env.Name, env.SecretRef.Name, env.SecretRef.Key))
+			}
+		}
+	}
+	return unresolved
 }
 
 func configMapName(proxy *proxyv1alpha1.Proxy) string {

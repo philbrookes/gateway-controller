@@ -476,6 +476,74 @@ var _ = Describe("Proxy Controller", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
+	It("blocks publication while a referenced secret is missing", func(ctx context.Context) {
+		proxy := validProxy("unresolved-refs")
+		// The Deployment would mount the certificate Secret, so a
+		// missing Secret must be reported as an unresolved reference
+		// instead of published as a pod that can never start. The
+		// reference is a fixed name: validProxy's name is generated
+		// only at creation.
+		proxy.Spec.Listeners[0].TLS = &proxyv1alpha1.PraxisListenerTLS{
+			CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "unresolved-refs-cert"},
+		}
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			accepted := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted)
+			gom.Expect(accepted).NotTo(BeNil())
+			gom.Expect(accepted.Status).To(Equal(metav1.ConditionTrue))
+			gom.Expect(accepted.Reason).To(Equal("Valid"))
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(resolved.Reason).To(Equal("UnresolvedRefs"))
+			gom.Expect(resolved.Message).To(ContainSubstring("not found"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+
+		// The unresolved reference must not publish anything.
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      proxy.Name + "-config",
+			Namespace: proxy.Namespace,
+		}, cm)
+		Expect(err).To(HaveOccurred())
+
+		// Creating the referenced Secret lets the proxy publish. The
+		// requeue polls for it; an annotation touch triggers the
+		// reconcile within the test's timeout.
+		cert := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "unresolved-refs-cert", Namespace: proxy.Namespace},
+			Data: map[string][]byte{
+				"tls.crt": []byte("cert"),
+				"tls.key": []byte("key"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, cert)).To(Succeed())
+		DeferCleanup(func(ctx context.Context) error {
+			return client.IgnoreNotFound(k8sClient.Delete(ctx, cert))
+		})
+		got := &proxyv1alpha1.Proxy{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+		if got.Annotations == nil {
+			got.Annotations = map[string]string{}
+		}
+		got.Annotations["praxis.io/resolved-touch"] = "true"
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionTrue))
+			programmed := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(programmed).NotTo(BeNil())
+			gom.Expect(programmed.Status).To(Equal(metav1.ConditionTrue))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("rejects a public admin bind without the opt-in", func(ctx context.Context) {
 		proxy := validProxy("admin-public")
 		// The Praxis runtime refuses non-loopback admin binds at startup

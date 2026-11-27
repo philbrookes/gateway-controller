@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -570,6 +571,261 @@ func TestReconcileProxy_PublishedRevisionRecordsCompletedWrites(t *testing.T) {
 				if err := cl.Get(ctx, key, deploy); err != nil || !metav1.IsControlledBy(deploy, proxy) {
 					t.Errorf("deployment should be published and controlled before the service write fails, got %v", err)
 				}
+			}
+		})
+	}
+}
+
+// TestReconcileProxy_UnresolvedReferences verifies reference
+// resolution gates publication: a spec referencing a Secret that does
+// not exist is reported as ResolvedRefs=False and publishes nothing —
+// the Deployment would mount or project the missing Secret and never
+// start — and the proxy publishes once the reference resolves.
+// Referenced Secrets are not owned by the proxy, so their creation
+// cannot trigger a reconcile; the unresolved path requeues to poll.
+func TestReconcileProxy_UnresolvedReferences(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	proxy := guardTestProxy()
+	proxy.Spec.Listeners[0].TLS = &proxyv1alpha1.PraxisListenerTLS{
+		CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "gw-cert"},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+
+	res, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key})
+	if err != nil {
+		t.Fatalf("reconcile proxy: %v", err)
+	}
+	if res.RequeueAfter <= 0 {
+		t.Errorf("reconcile of unresolved references must requeue, got %+v", res)
+	}
+	got := &proxyv1alpha1.Proxy{}
+	if err := cl.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy: %v", err)
+	}
+	accepted := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted)
+	if accepted == nil || accepted.Status != metav1.ConditionTrue || accepted.Reason != "Valid" {
+		t.Errorf("Accepted condition = %+v, want True/Valid: the spec itself is valid", accepted)
+	}
+	resolved := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+	if resolved == nil || resolved.Status != metav1.ConditionFalse || resolved.Reason != "UnresolvedRefs" {
+		t.Fatalf("ResolvedRefs condition = %+v, want False/UnresolvedRefs", resolved)
+	}
+	if !strings.Contains(resolved.Message, `secret "gw-cert" not found`) {
+		t.Errorf("ResolvedRefs message %q does not name the missing secret", resolved.Message)
+	}
+	for _, obj := range []client.Object{
+		&corev1.ConfigMap{},
+		&appsv1.Deployment{},
+		&corev1.Service{},
+	} {
+		if err := cl.Get(ctx, key, obj); !apierrors.IsNotFound(err) {
+			t.Errorf("%T must not be published while references are unresolved, got %v", obj, err)
+		}
+	}
+
+	// Creating the referenced secret lets the next reconcile publish.
+	cert := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "gw-cert", Namespace: proxy.Namespace},
+		Data:       map[string][]byte{tlsCertificateKey: []byte("cert"), tlsPrivateKeyKey: []byte("key")},
+	}
+	if err := cl.Create(ctx, cert); err != nil {
+		t.Fatalf("create secret: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile proxy after the secret appears: %v", err)
+	}
+	got = &proxyv1alpha1.Proxy{}
+	if err := cl.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy after the secret appears: %v", err)
+	}
+	resolved = apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+	if resolved == nil || resolved.Status != metav1.ConditionTrue || resolved.Reason != "ResolvedRefs" {
+		t.Errorf("ResolvedRefs condition = %+v, want True/ResolvedRefs after the secret appears", resolved)
+	}
+	programmed := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+	if programmed == nil || programmed.Status != metav1.ConditionTrue {
+		t.Errorf("Programmed condition = %+v, want True after the secret appears", programmed)
+	}
+}
+
+// TestReconcileProxy_UnresolvedReferencesBoundsMessage verifies the
+// unresolved-reference report stays within the condition-message limit
+// the API server enforces: the report quotes reference names from the
+// spec, which validation does not length-bound.
+func TestReconcileProxy_UnresolvedReferencesBoundsMessage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	proxy := guardTestProxy()
+	proxy.Spec.SecretEnv = []proxyv1alpha1.PraxisSecretEnv{{
+		Name:      strings.Repeat("e", maxConditionMessageLen),
+		SecretRef: proxyv1alpha1.PraxisSecretKeyRef{Name: "missing", Key: "api_key"},
+	}}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile proxy: %v", err)
+	}
+	got := &proxyv1alpha1.Proxy{}
+	if err := cl.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy: %v", err)
+	}
+	resolved := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+	if resolved == nil || resolved.Status != metav1.ConditionFalse || resolved.Reason != "UnresolvedRefs" {
+		t.Fatalf("ResolvedRefs condition = %+v, want False/UnresolvedRefs", resolved)
+	}
+	if len(resolved.Message) > maxConditionMessageLen {
+		t.Errorf("ResolvedRefs message is %d bytes, want at most %d", len(resolved.Message), maxConditionMessageLen)
+	}
+}
+
+// TestResolveReferences verifies the pre-publication reference check:
+// every Secret the spec references — listener TLS certificates and
+// projected environment keys — must exist with the keys the Deployment
+// mounts and projects, every unresolved reference is reported, and a
+// spec without references resolves trivially.
+func TestResolveReferences(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+	tlsListener := func(secret string) proxyv1alpha1.PraxisListener {
+		return proxyv1alpha1.PraxisListener{
+			Name:         "https",
+			Port:         8443,
+			FilterChains: []string{"main"},
+			TLS:          &proxyv1alpha1.PraxisListenerTLS{CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: secret}},
+		}
+	}
+	certSecret := func(name string, keys ...string) *corev1.Secret {
+		data := map[string][]byte{}
+		for _, key := range keys {
+			data[key] = []byte(key)
+		}
+		return &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"}, Data: data}
+	}
+
+	tests := []struct {
+		name    string
+		proxy   *proxyv1alpha1.Proxy
+		objects []client.Object
+		want    []string
+	}{
+		{
+			name:  "inline-only spec resolves trivially",
+			proxy: guardTestProxy(),
+		},
+		{
+			name: "missing TLS certificate secret",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.Listeners[0].TLS = &proxyv1alpha1.PraxisListenerTLS{
+					CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "missing-cert"},
+				}
+				return proxy
+			}(),
+			want: []string{`listener "http": TLS certificate secret "missing-cert" not found`},
+		},
+		{
+			name: "TLS certificate secret lacking the private key",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.Listeners[0] = tlsListener("partial-cert")
+				return proxy
+			}(),
+			objects: []client.Object{certSecret("partial-cert", tlsCertificateKey)},
+			want:    []string{`listener "https": TLS certificate secret "partial-cert" lacks key "tls.key"`},
+		},
+		{
+			name: "complete TLS certificate secret resolves",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.Listeners[0] = tlsListener("full-cert")
+				return proxy
+			}(),
+			objects: []client.Object{certSecret("full-cert", tlsCertificateKey, tlsPrivateKeyKey)},
+		},
+		{
+			name: "missing secretEnv secret",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.SecretEnv = []proxyv1alpha1.PraxisSecretEnv{{
+					Name:      "API_KEY",
+					SecretRef: proxyv1alpha1.PraxisSecretKeyRef{Name: "api-creds", Key: "api_key"},
+				}}
+				return proxy
+			}(),
+			want: []string{`secretEnv "API_KEY": secret "api-creds" not found`},
+		},
+		{
+			name: "secretEnv secret lacking the key",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.SecretEnv = []proxyv1alpha1.PraxisSecretEnv{{
+					Name:      "API_KEY",
+					SecretRef: proxyv1alpha1.PraxisSecretKeyRef{Name: "api-creds", Key: "api_key"},
+				}}
+				return proxy
+			}(),
+			objects: []client.Object{certSecret("api-creds", "other_key")},
+			want:    []string{`secretEnv "API_KEY": secret "api-creds" lacks key "api_key"`},
+		},
+		{
+			name: "complete secretEnv secret resolves",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.SecretEnv = []proxyv1alpha1.PraxisSecretEnv{{
+					Name:      "API_KEY",
+					SecretRef: proxyv1alpha1.PraxisSecretKeyRef{Name: "api-creds", Key: "api_key"},
+				}}
+				return proxy
+			}(),
+			objects: []client.Object{certSecret("api-creds", "api_key")},
+		},
+		{
+			name: "every unresolved reference is reported",
+			proxy: func() *proxyv1alpha1.Proxy {
+				proxy := guardTestProxy()
+				proxy.Spec.Listeners[0] = tlsListener("missing-cert")
+				proxy.Spec.SecretEnv = []proxyv1alpha1.PraxisSecretEnv{{
+					Name:      "API_KEY",
+					SecretRef: proxyv1alpha1.PraxisSecretKeyRef{Name: "api-creds", Key: "api_key"},
+				}}
+				return proxy
+			}(),
+			want: []string{
+				`listener "https": TLS certificate secret "missing-cert" not found`,
+				`secretEnv "API_KEY": secret "api-creds" not found`,
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(tc.objects...).Build()
+			r := &ProxyReconciler{Client: cl, Scheme: scheme}
+
+			got := r.resolveReferences(ctx, tc.proxy)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("resolveReferences() = %q, want %q", got, tc.want)
 			}
 		})
 	}

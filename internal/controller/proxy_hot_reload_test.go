@@ -10,6 +10,7 @@ import (
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -196,7 +197,13 @@ func TestReconcileProxy_UnchangedReconcileSkipsDeploymentUpdate(t *testing.T) {
 	var deploymentUpdates atomic.Int32
 	cl := fake.NewClientBuilder().WithScheme(scheme).
 		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
-		WithObjects(proxy).
+		WithObjects(proxy, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "gw-tls", Namespace: proxy.Namespace},
+			Data: map[string][]byte{
+				tlsCertificateKey: []byte("cert"),
+				tlsPrivateKeyKey:  []byte("key"),
+			},
+		}).
 		WithInterceptorFuncs(interceptor.Funcs{
 			Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 				if _, ok := obj.(*appsv1.Deployment); ok {

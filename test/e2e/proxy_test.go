@@ -202,6 +202,85 @@ var _ = Describe("Proxy runtime", func() {
 			}
 		}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
 	})
+
+	It("blocks publication until a referenced TLS secret resolves", SpecTimeout(5*time.Minute), func(ctx context.Context) {
+		image := os.Getenv("PRAXIS_E2E_IMAGE")
+		Expect(image).NotTo(BeEmpty(), "set PRAXIS_E2E_IMAGE to a verified Praxis runtime image available to the cluster")
+
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "proxy-e2e-"}}
+		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+		DeferCleanup(func(ctx context.Context) error {
+			if CurrentSpecReport().Failed() {
+				dumpProxyDiagnostics(ctx, namespace.Name)
+			}
+			return client.IgnoreNotFound(k8sClient.Delete(ctx, namespace))
+		})
+
+		// The certificate Secret does not exist yet. The proxy must
+		// report the unresolved reference and publish nothing: the
+		// Deployment would mount the missing Secret volume and never
+		// start. The report saying "not found" also proves the manager
+		// may read Secrets, so the RBAC for the reference check works.
+		proxy := &proxyv1alpha1.Proxy{
+			ObjectMeta: metav1.ObjectMeta{Name: "tls-unresolved", Namespace: namespace.Name},
+			Spec: proxyv1alpha1.ProxySpec{
+				Image: image, Replicas: new(int32(1)),
+				Listeners: []proxyv1alpha1.PraxisListener{{
+					Name: "https", Port: proxyInitialPort, FilterChains: []string{"main"},
+					TLS: &proxyv1alpha1.PraxisListenerTLS{
+						CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "tls-unresolved-cert"},
+					},
+				}},
+				FilterChains: []proxyv1alpha1.ProxyFilterChain{{
+					Name: "main",
+					Filters: []proxyv1alpha1.PraxisFilterEntry{{
+						Name: "response", InlineFilter: staticResponse("v1"),
+					}},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, proxy)).To(Succeed())
+		key := client.ObjectKeyFromObject(proxy)
+
+		By("reporting the unresolved reference without publishing")
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionFalse))
+			gom.Expect(resolved.Reason).To(Equal("UnresolvedRefs"))
+			gom.Expect(resolved.Message).To(ContainSubstring(`secret "tls-unresolved-cert" not found`),
+				"a Forbidden message would mean the manager lacks Secret read RBAC: %+v", resolved)
+		}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
+		Expect(k8sClient.Get(ctx, key, &appsv1.Deployment{})).NotTo(Succeed(),
+			"the Deployment must not exist while the reference is unresolved")
+
+		By("publishing once the referenced secret appears")
+		cert := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "tls-unresolved-cert", Namespace: namespace.Name},
+			Data: map[string][]byte{
+				"tls.crt": []byte("cert"),
+				"tls.key": []byte("key"),
+			},
+		}
+		Expect(k8sClient.Create(ctx, cert)).To(Succeed())
+		// Referenced Secrets are not owned by the proxy, so the
+		// controller polls for them; the bogus certificate material is
+		// enough for the reference check — runtime readiness is not
+		// this spec's concern.
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, key, got)).To(Succeed())
+			resolved := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+			gom.Expect(resolved).NotTo(BeNil())
+			gom.Expect(resolved.Status).To(Equal(metav1.ConditionTrue))
+			programmed := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(programmed).NotTo(BeNil())
+			gom.Expect(programmed.Status).To(Equal(metav1.ConditionTrue))
+		}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
+		Expect(k8sClient.Get(ctx, key, &appsv1.Deployment{})).To(Succeed())
+	})
 })
 
 func staticResponse(body string) *proxyv1alpha1.PraxisInlineFilter {
