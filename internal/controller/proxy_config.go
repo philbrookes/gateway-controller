@@ -8,6 +8,8 @@ import (
 	"net"
 	"strconv"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -39,41 +41,70 @@ const (
 	// answers with.
 	readinessResponseStatus = 200
 	// dualStackWildcard is the address the controller-rendered readiness
-	// listener binds: the IPv6 wildcard, the only listener address that
-	// accepts connections on the pod IP's family whichever it is — Linux
-	// dual-stack sockets accept IPv4 connections on it via IPv4-mapped
-	// addresses. Detecting the family instead is not possible in this
-	// renderer: the config is rendered from the spec before any pod
-	// exists, and the spec's binds do not determine the pod network —
-	// listeners bound only to loopback or to 0.0.0.0 (the API default)
-	// leave the family unknown, and an IPv4 wildcard would never answer
-	// the kubelet's dial to an IPv6 pod IP. A netns with IPv6 disabled
-	// cannot bind this address, but such clusters are IPv4-only by
-	// construction.
+	// listener binds on IPv6-primary pod networks, and when the pod
+	// network's primary family is unknown: the IPv6 wildcard, the only
+	// listener address that accepts connections on the pod IP's family
+	// whichever it is — Linux dual-stack sockets accept IPv4 connections
+	// on it through IPv4-mapped addresses. Binding it requires IPv6 in
+	// the pod netns, so an IPv6-disabled netns or IPv6-only binding
+	// (net.ipv6.bindv6only) cannot serve it; IPv4-primary networks bind
+	// the IPv4 wildcard instead (readinessWildcard).
 	dualStackWildcard = "::"
 )
 
+// clusterPrimaryIPFamily returns the pod network's primary IP family,
+// read from the default/kubernetes Service the API server allocates in
+// the cluster's primary family — the same family the pod network
+// allocates pod IPs in, so it is the family of the pod IP the kubelet
+// dials for probes. The empty value means unknown: the Service is
+// absent or reports no families, leaving callers to family-agnostic
+// behavior. Any error other than absence is returned so a transient
+// read fails the reconcile instead of silently flipping the rendered
+// configuration.
+func clusterPrimaryIPFamily(ctx context.Context, reader client.Reader) (corev1.IPFamily, error) {
+	kubernetes := &corev1.Service{}
+	err := reader.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, kubernetes)
+	if apierrors.IsNotFound(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get default/kubernetes service: %w", err)
+	}
+	if len(kubernetes.Spec.IPFamilies) == 0 {
+		return "", nil
+	}
+	return kubernetes.Spec.IPFamilies[0], nil
+}
+
 // podIPBind reports whether a listener bound to bindAddress accepts
-// connections on the pod IP the kubelet dials, whichever family that IP
-// has. Only the IPv6 wildcard does: it accepts IPv6 dials, and IPv4 dials
-// via IPv4-mapped addresses. A nil bind renders as the IPv4 wildcard —
-// as does the API-defaulted "0.0.0.0" — which never answers a dial to an
-// IPv6 pod IP.
-func podIPBind(bindAddress *string) bool {
+// connections on the pod IP the kubelet dials, whose family is the pod
+// network's primary family. The wildcard of that family answers, and
+// so does the IPv6 wildcard on an IPv4-primary network, through the
+// IPv4-mapped addresses Linux dual-stack sockets accept. When the
+// family is unknown only the IPv6 wildcard qualifies: it answers dials
+// of either family, while the IPv4 wildcard would never answer a dial
+// to an IPv6 pod IP. A nil bind renders as the IPv4 wildcard.
+func podIPBind(bindAddress *string, primary corev1.IPFamily) bool {
 	if bindAddress == nil {
-		return false
+		return primary == corev1.IPv4Protocol
 	}
 	ip := net.ParseIP(*bindAddress)
-	return ip != nil && ip.To4() == nil && ip.IsUnspecified()
+	if ip == nil || !ip.IsUnspecified() {
+		return false
+	}
+	if ip.To4() != nil {
+		return primary == corev1.IPv4Protocol
+	}
+	return true
 }
 
 // podIPListener returns the first spec listener the readiness probe can
-// reach through the pod IP, or nil when none can: only a listener bound
-// to the dual-stack IPv6 wildcard accepts the kubelet's dial on either
-// pod IP family.
-func podIPListener(spec *proxyv1alpha1.ProxySpec) *proxyv1alpha1.PraxisListener {
+// reach through the pod IP, or nil when none can: only wildcard binds
+// answer the kubelet's dial on the pod network's primary family (see
+// podIPBind).
+func podIPListener(spec *proxyv1alpha1.ProxySpec, primary corev1.IPFamily) *proxyv1alpha1.PraxisListener {
 	for i := range spec.Listeners {
-		if podIPBind(spec.Listeners[i].BindAddress) {
+		if podIPBind(spec.Listeners[i].BindAddress, primary) {
 			return &spec.Listeners[i]
 		}
 	}
@@ -166,22 +197,36 @@ func readinessFilterChain(spec *proxyv1alpha1.ProxySpec) nativeChain {
 	}
 }
 
+// readinessWildcard is the address the controller-rendered readiness
+// listener binds: the wildcard of the pod network's primary family,
+// which the kubelet's dial to the pod IP always reaches. The IPv6
+// wildcard also answers IPv4 dials through IPv4-mapped addresses, so it
+// is kept when the family is unknown — but binding it needs IPv6
+// available in the pod netns, which an IPv4-primary network cannot
+// promise, so that network binds the IPv4 wildcard instead.
+func readinessWildcard(primary corev1.IPFamily) string {
+	if primary == corev1.IPv4Protocol {
+		return defaultBindAddress
+	}
+	return dualStackWildcard
+}
+
 // renderReadinessListener returns the listener the controller appends to
 // the rendered config when no spec listener is reachable through the pod
-// IP: a dual-stack wildcard-bound listener dedicated to the readiness
-// probe, executing only the health-only static_response chain. It
+// IP: a wildcard-bound listener dedicated to the readiness probe,
+// executing only the health-only static_response chain. It
 // mirrors the first listener's TLS material — already mounted for that
 // listener — so a TLS-enabled proxy keeps no plaintext port. A TCP probe
 // still succeeds against a TLS listener, which accepts the connection
 // before any handshake.
-func renderReadinessListener(spec *proxyv1alpha1.ProxySpec) nativeListener {
+func renderReadinessListener(spec *proxyv1alpha1.ProxySpec, primary corev1.IPFamily) nativeListener {
 	var listenerTLS *nativeTLS
 	if len(spec.Listeners) > 0 {
 		listenerTLS = renderListenerTLS(&spec.Listeners[0])
 	}
 	return nativeListener{
 		Name:         readinessListenerName(spec),
-		Address:      net.JoinHostPort(dualStackWildcard, strconv.FormatInt(int64(readinessPort(spec)), 10)),
+		Address:      net.JoinHostPort(readinessWildcard(primary), strconv.FormatInt(int64(readinessPort(spec)), 10)),
 		FilterChains: []string{readinessChainName(spec)},
 		TLS:          listenerTLS,
 	}
@@ -236,7 +281,7 @@ type renderedConfig struct {
 	PolicyDocuments map[string]string
 }
 
-func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1alpha1.ProxySpec, namespace string) (*renderedConfig, error) {
+func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1alpha1.ProxySpec, namespace string, primary corev1.IPFamily) (*renderedConfig, error) {
 	cfg := nativeConfig{}
 	rendered := &renderedConfig{PolicyDocuments: map[string]string{}}
 
@@ -267,14 +312,14 @@ func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1a
 	}
 
 	// No spec listener accepts connections on the pod IP — every
-	// listener binds a specific address or the IPv4-only wildcard — so
-	// the readiness probe needs the dedicated dual-stack listener to
-	// target. It executes only the health-only static_response chain, so
-	// it accepts connections purely for the probe and cannot route
-	// application traffic.
-	renderReadiness := podIPListener(spec) == nil
+	// listener binds a specific address or a wildcard of a family the
+	// pod IP does not have — so the readiness probe needs the dedicated
+	// wildcard listener to target. It executes only the health-only
+	// static_response chain, so it accepts connections purely for the
+	// probe and cannot route application traffic.
+	renderReadiness := podIPListener(spec, primary) == nil
 	if renderReadiness {
-		cfg.Listeners = append(cfg.Listeners, renderReadinessListener(spec))
+		cfg.Listeners = append(cfg.Listeners, renderReadinessListener(spec, primary))
 	}
 
 	if len(spec.FilterChains) > 0 {

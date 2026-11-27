@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -61,6 +62,24 @@ func createProxy(ctx context.Context, proxy *proxyv1alpha1.Proxy) {
 	DeferCleanup(func(ctx context.Context) error {
 		return client.IgnoreNotFound(k8sClient.Delete(ctx, proxy))
 	})
+}
+
+// expectKubernetesServiceFamily pins the primary-family signal the
+// controller reads: clusterPrimaryIPFamily inspects the
+// default/kubernetes Service, which the envtest control plane
+// bootstraps from its own service network. Tests that assert
+// family-aware readiness wiring call this so a changed bootstrap fails
+// here with a clear message instead of as unrelated readiness assertion
+// failures.
+func expectKubernetesServiceFamily(ctx context.Context, family corev1.IPFamily) error {
+	kubernetes := &corev1.Service{}
+	if err := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: "kubernetes"}, kubernetes); err != nil {
+		return fmt.Errorf("get default/kubernetes service: %w", err)
+	}
+	if len(kubernetes.Spec.IPFamilies) != 1 || kubernetes.Spec.IPFamilies[0] != family {
+		return fmt.Errorf("default/kubernetes reports families %v, want [%s]", kubernetes.Spec.IPFamilies, family)
+	}
+	return nil
 }
 
 // policyRefEntry returns a filter entry referencing a Policy in the
@@ -309,6 +328,10 @@ var _ = Describe("Proxy Controller", func() {
 		proxy := validProxy("readiness-dedicated")
 		loopback := "127.0.0.1"
 		proxy.Spec.Listeners[0].BindAddress = &loopback
+		// This control plane bootstraps an IPv4-primary service network
+		// (the same signal the controller reads), so the dedicated
+		// readiness listener binds the IPv4 wildcard, not ::.
+		Expect(expectKubernetesServiceFamily(ctx, corev1.IPv4Protocol)).To(Succeed())
 		createProxy(ctx, proxy)
 
 		Eventually(func(gom Gomega, ctx context.Context) {
@@ -336,9 +359,10 @@ var _ = Describe("Proxy Controller", func() {
 				Namespace: proxy.Namespace,
 			}, cm)).To(Succeed())
 			// The dedicated readiness listener must be health-only: it
-			// binds the dual-stack wildcard so the kubelet's dial to the
-			// pod IP succeeds on either family, and its chain cannot
-			// route application traffic.
+			// binds the wildcard of the pod network's primary family —
+			// IPv4 here, since the control plane reports IPv4 as
+			// primary — so the kubelet's dial to the pod IP succeeds,
+			// and its chain cannot route application traffic.
 			var rendered renderedConfig
 			gom.Expect(yaml.Unmarshal([]byte(cm.Data["config.yaml"]), &rendered)).To(Succeed())
 			var readiness *renderedListener
@@ -348,7 +372,7 @@ var _ = Describe("Proxy Controller", func() {
 				}
 			}
 			gom.Expect(readiness).NotTo(BeNil())
-			gom.Expect(readiness.Address).To(Equal("[::]:19902"))
+			gom.Expect(readiness.Address).To(Equal("0.0.0.0:19902"))
 			// The readiness listener references a dedicated health-only
 			// chain — the Praxis validator rejects chainless HTTP
 			// listeners — whose single static_response filter answers
@@ -462,6 +486,11 @@ var _ = Describe("Proxy Controller", func() {
 
 	It("should create a Deployment with correct container spec", func(ctx context.Context) {
 		proxy := validProxy("deploy")
+		// This control plane bootstraps an IPv4-primary service network,
+		// so the default bind's IPv4 wildcard is probe-reachable through
+		// the pod's IPv4 address and no dedicated readiness listener is
+		// rendered.
+		Expect(expectKubernetesServiceFamily(ctx, corev1.IPv4Protocol)).To(Succeed())
 		createProxy(ctx, proxy)
 
 		Eventually(func(gom Gomega, ctx context.Context) {
@@ -473,28 +502,33 @@ var _ = Describe("Proxy Controller", func() {
 			containers := deploy.Spec.Template.Spec.Containers
 			gom.Expect(containers).To(HaveLen(1))
 			gom.Expect(containers[0].Image).To(Equal(proxy.Spec.Image))
-			// The listener port plus the controller-rendered dual-stack
-			// readiness port: the default bind renders the IPv4 wildcard,
-			// which is not reachable through an IPv6 pod IP.
-			gom.Expect(containers[0].Ports).To(HaveLen(2))
+			// Only the listener's own named port: the default bind
+			// renders the IPv4 wildcard, which answers the kubelet's
+			// dial to the pod's IPv4 address on this IPv4-primary
+			// control plane, so the probe targets the spec listener
+			// directly.
+			gom.Expect(containers[0].Ports).To(HaveLen(1))
+			gom.Expect(containers[0].Ports[0].Name).To(Equal("http"))
 			gom.Expect(containers[0].Ports[0].ContainerPort).To(Equal(int32(8080)))
-			gom.Expect(containers[0].Ports[1].Name).To(Equal("readiness"))
-			gom.Expect(containers[0].Ports[1].ContainerPort).To(Equal(int32(19902)))
 			gom.Expect(deploy.Spec.Template.Annotations).To(HaveKey("praxis.io/startup-revision"))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 
 	It("keeps replacement pods unready until the listener readiness probe succeeds", func(ctx context.Context) {
 		proxy := validProxy("readiness-probe")
+		// This control plane bootstraps an IPv4-primary service network.
+		Expect(expectKubernetesServiceFamily(ctx, corev1.IPv4Protocol)).To(Succeed())
 		createProxy(ctx, proxy)
 
 		// envtest runs no kubelet, so the observable contract is the probe
 		// wiring: the pod template must carry a TCP readiness probe. The
-		// default bind renders the IPv4 wildcard, which never answers the
-		// kubelet's dial to an IPv6 pod IP, so the probe targets the
-		// controller's dedicated dual-stack readiness listener. Kubernetes
-		// then holds a replacement pod out of the Service endpoints until
-		// Praxis has bound the listener and the probe connection succeeds.
+		// default bind renders the IPv4 wildcard, which answers the
+		// kubelet's dial to the pod's IPv4 address on this IPv4-primary
+		// control plane, so the probe targets the spec listener's named
+		// port directly and no dedicated readiness listener is needed.
+		// Kubernetes then holds a replacement pod out of the Service
+		// endpoints until Praxis has bound the listener and the probe
+		// connection succeeds.
 		var revisionBefore string
 		Eventually(func(gom Gomega, ctx context.Context) {
 			deploy := &appsv1.Deployment{}
@@ -504,7 +538,7 @@ var _ = Describe("Proxy Controller", func() {
 			probe := containers[0].ReadinessProbe
 			gom.Expect(probe).NotTo(BeNil())
 			gom.Expect(probe.TCPSocket).NotTo(BeNil())
-			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("readiness"))
+			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("http"))
 			revisionBefore = deploy.Spec.Template.Annotations["praxis.io/startup-revision"]
 			gom.Expect(revisionBefore).NotTo(BeEmpty())
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
@@ -530,7 +564,7 @@ var _ = Describe("Proxy Controller", func() {
 			probe := deploy.Spec.Template.Spec.Containers[0].ReadinessProbe
 			gom.Expect(probe).NotTo(BeNil())
 			gom.Expect(probe.TCPSocket).NotTo(BeNil())
-			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("readiness"))
+			gom.Expect(probe.TCPSocket.Port.StrVal).To(Equal("http"))
 		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
 	})
 

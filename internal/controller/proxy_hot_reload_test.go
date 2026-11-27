@@ -123,7 +123,7 @@ func TestReconcileProxy_RolloutTriggers(t *testing.T) {
 func TestBuildPodTemplate_ConfigMountReceivesUpdates(t *testing.T) {
 	t.Parallel()
 	proxy := guardTestProxy()
-	template := buildPodTemplate(proxy, "revision")
+	template := buildPodTemplate(proxy, "revision", "")
 	for _, volume := range template.Spec.Volumes {
 		if volume.Name != configVolumeName {
 			continue
@@ -157,7 +157,7 @@ func TestBuildPodTemplate_ConfigAndTLSMounts(t *testing.T) {
 	proxy.Spec.Listeners[0].TLS = &proxyv1alpha1.PraxisListenerTLS{
 		CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "gateway-tls"},
 	}
-	container := buildPodTemplate(proxy, "revision").Spec.Containers[0]
+	container := buildPodTemplate(proxy, "revision", "").Spec.Containers[0]
 	wantArgs := []string{"--config", "/etc/praxis/config/config.yaml"}
 	if !reflect.DeepEqual(container.Args, wantArgs) {
 		t.Errorf("args = %v, want %v", container.Args, wantArgs)

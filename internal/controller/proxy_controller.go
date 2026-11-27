@@ -77,7 +77,17 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
 		metav1.ConditionTrue, "Valid", "Proxy specification is valid", proxy.Generation)
 
-	rendered, err := renderProxyConfig(ctx, r.Client, &proxy.Spec, proxy.Namespace)
+	// The pod network's primary family decides which wildcard the
+	// readiness path can bind and which spec listeners the probe can
+	// reach: an IPv6 wildcard needs IPv6 in the pod netns, which an
+	// IPv4-primary network cannot promise. An absent signal (no
+	// default/kubernetes Service) keeps the family-agnostic behavior.
+	primary, err := clusterPrimaryIPFamily(ctx, r.Client)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("read cluster primary IP family: %w", err)
+	}
+
+	rendered, err := renderProxyConfig(ctx, r.Client, &proxy.Spec, proxy.Namespace, primary)
 	if err != nil {
 		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
 			metav1.ConditionFalse, "ConfigRenderError", err.Error(), proxy.Generation)
@@ -129,7 +139,7 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileDeployment(ctx, &proxy, startupRevision); err != nil {
+	if err := r.reconcileDeployment(ctx, &proxy, startupRevision, primary); err != nil {
 		return ctrl.Result{}, fmt.Errorf("reconcile deployment: %w", err)
 	}
 
@@ -206,7 +216,7 @@ func (r *ProxyReconciler) reconcileConfigMap(ctx context.Context, proxy *proxyv1
 // startupRevisionAnnotation changes only for settings that Praxis cannot reload.
 const startupRevisionAnnotation = "praxis.io/startup-revision"
 
-func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv1alpha1.Proxy, revision string) error {
+func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv1alpha1.Proxy, revision string, primary corev1.IPFamily) error {
 	desired := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      proxy.Name,
@@ -228,7 +238,7 @@ func (r *ProxyReconciler) reconcileDeployment(ctx context.Context, proxy *proxyv
 		desired.Spec.Selector = &metav1.LabelSelector{
 			MatchLabels: proxyLabels(proxy),
 		}
-		desired.Spec.Template = buildPodTemplate(proxy, revision)
+		desired.Spec.Template = buildPodTemplate(proxy, revision, primary)
 		return nil
 	})
 	return err
@@ -242,7 +252,7 @@ func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
 	}
 }
 
-func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTemplateSpec {
+func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string, primary corev1.IPFamily) corev1.PodTemplateSpec {
 	volumes, mounts := buildVolumes(proxy)
 	gracePeriod := defaultTerminationGracePeriod
 	container := corev1.Container{
@@ -250,10 +260,10 @@ func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string) corev1.PodTem
 		Image:                    proxy.Spec.Image,
 		Command:                  []string{containerName},
 		Args:                     []string{"--config", configMountPath + "/" + configFileName},
-		Ports:                    buildContainerPorts(proxy),
+		Ports:                    buildContainerPorts(proxy, primary),
 		VolumeMounts:             mounts,
 		Env:                      buildEnvVars(proxy),
-		ReadinessProbe:           buildReadinessProbe(proxy),
+		ReadinessProbe:           buildReadinessProbe(proxy, primary),
 		ImagePullPolicy:          corev1.PullIfNotPresent,
 		TerminationMessagePath:   corev1.TerminationMessagePathDefault,
 		TerminationMessagePolicy: corev1.TerminationMessageReadFile,
@@ -328,22 +338,21 @@ func buildVolumes(proxy *proxyv1alpha1.Proxy) ([]corev1.Volume, []corev1.VolumeM
 // buildReadinessProbe gates pod readiness on Praxis actually serving.
 // The runtime has no dedicated health endpoint, so the probe is a TCP
 // connect against a listener the kubelet can reach through the pod IP
-// (it dials the pod IP from the node): the first listener bound to the
-// dual-stack IPv6 wildcard, the only bind that answers the dial on
-// either pod IP family. Listeners bound to the IPv4 wildcard (the
-// default bind) or to specific addresses such as loopback cannot be
-// reached through an IPv6 pod IP, so the controller renders a dedicated
-// dual-stack readiness listener into the config and the probe targets
-// that instead. The port is referenced by name in both cases, so the
-// wiring survives port renumbering; a replacement pod therefore stays
-// unready during startup until Praxis has bound the listener and can
-// accept traffic.
-func buildReadinessProbe(proxy *proxyv1alpha1.Proxy) *corev1.Probe {
+// (it dials the pod IP from the node): the first listener bound to a
+// wildcard of the pod network's primary family. Listeners bound to
+// specific addresses such as loopback, or to a wildcard of a family the
+// pod IP does not have, cannot be reached, so the controller renders a
+// dedicated wildcard-bound readiness listener into the config and the
+// probe targets that instead. The port is referenced by name in both
+// cases, so the wiring survives port renumbering; a replacement pod
+// therefore stays unready during startup until Praxis has bound the
+// listener and can accept traffic.
+func buildReadinessProbe(proxy *proxyv1alpha1.Proxy, primary corev1.IPFamily) *corev1.Probe {
 	if len(proxy.Spec.Listeners) == 0 {
 		return nil
 	}
 	portName := readinessListenerName(&proxy.Spec)
-	if reachable := podIPListener(&proxy.Spec); reachable != nil {
+	if reachable := podIPListener(&proxy.Spec, primary); reachable != nil {
 		portName = reachable.Name
 	}
 	const (
@@ -367,7 +376,7 @@ func buildReadinessProbe(proxy *proxyv1alpha1.Proxy) *corev1.Probe {
 	}
 }
 
-func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
+func buildContainerPorts(proxy *proxyv1alpha1.Proxy, primary corev1.IPFamily) []corev1.ContainerPort {
 	ports := make([]corev1.ContainerPort, 0, len(proxy.Spec.Listeners))
 	for _, listener := range proxy.Spec.Listeners {
 		ports = append(ports, corev1.ContainerPort{
@@ -379,7 +388,7 @@ func buildContainerPorts(proxy *proxyv1alpha1.Proxy) []corev1.ContainerPort {
 	// The readiness probe targets the controller-rendered readiness
 	// listener when no spec listener is reachable through the pod IP;
 	// declare its port so the probe's named reference resolves.
-	if podIPListener(&proxy.Spec) == nil {
+	if podIPListener(&proxy.Spec, primary) == nil {
 		ports = append(ports, corev1.ContainerPort{
 			Name:          readinessListenerName(&proxy.Spec),
 			ContainerPort: readinessPort(&proxy.Spec),

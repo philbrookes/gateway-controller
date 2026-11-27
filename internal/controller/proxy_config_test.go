@@ -1,15 +1,18 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/yaml"
 
 	proxyv1alpha1 "github.com/praxis-proxy/gateway-controller/api/proxy/v1alpha1"
@@ -32,7 +35,7 @@ func TestRenderProxyConfig_Minimal(t *testing.T) {
 		Image:     "ghcr.io/praxis-proxy/praxis:latest",
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -67,7 +70,7 @@ func TestRenderProxyConfig_AdminAndInsecure(t *testing.T) {
 		},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -101,7 +104,7 @@ func TestRenderProxyConfig_IPv6BindAddress(t *testing.T) {
 			FilterChains: []string{},
 		}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -126,7 +129,7 @@ func TestRenderProxyConfig_ListenerTLS(t *testing.T) {
 			TLS:         &proxyv1alpha1.PraxisListenerTLS{CertificateRef: proxyv1alpha1.PraxisLocalReference{Name: "gw-tls"}},
 		}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -165,7 +168,7 @@ func TestRenderProxyConfig_ReservedKeysProtected(t *testing.T) {
 		}},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080, FilterChains: []string{"main"}}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -203,7 +206,7 @@ func TestRenderProxyConfig_InlineFilter(t *testing.T) {
 		}},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080, FilterChains: []string{"main"}}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -253,7 +256,7 @@ func TestRenderProxyConfig_PolicyRef(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "other-ns", Name: "my-policy"},
 			Spec:       proxyv1alpha1.PolicySpec{Document: policyDocument},
 		}
-		got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "default")
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "default", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -294,7 +297,7 @@ func TestRenderProxyConfig_PolicyRef(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{Namespace: "my-ns", Name: "local-policy"},
 			Spec:       proxyv1alpha1.PolicySpec{Document: policyDocument},
 		}
-		got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "my-ns")
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "my-ns", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -369,7 +372,7 @@ func TestRenderProxyConfig_PolicyFilterConfig(t *testing.T) {
 			},
 		},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t, policy), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -474,7 +477,7 @@ func TestRenderProxyConfig_PolicyDocumentCollection(t *testing.T) {
 			Spec:       proxyv1alpha1.PolicySpec{Document: secondDocument},
 		},
 	)
-	got, err := renderProxyConfig(t.Context(), reader, spec, "default")
+	got, err := renderProxyConfig(t.Context(), reader, spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -510,7 +513,7 @@ func TestRenderProxyConfig_PolicyLookupError(t *testing.T) {
 	}
 	// The referenced Policy is absent from the reader, so the render
 	// fails with the lookup error.
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err == nil {
 		t.Fatalf("expected a policy lookup error, got config %q", got.Config)
 	}
@@ -559,7 +562,7 @@ func TestRenderProxyConfig_Conditions(t *testing.T) {
 		}},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -610,7 +613,7 @@ func TestRenderProxyConfig_UpstreamMatch(t *testing.T) {
 		}},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -638,7 +641,7 @@ func TestRenderProxyConfig_FilterChainRefs(t *testing.T) {
 		},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080, FilterChains: []string{"a", "b"}}},
 	}
-	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -669,7 +672,7 @@ func TestRenderProxyConfig_UnsupportedFilterRef(t *testing.T) {
 		}},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
-	_, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+	_, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 	if err == nil {
 		t.Fatal("expected error for unsupported filter reference")
 	}
@@ -678,12 +681,222 @@ func TestRenderProxyConfig_UnsupportedFilterRef(t *testing.T) {
 	}
 }
 
+// TestClusterPrimaryIPFamily verifies the controller reads the pod
+// network's primary family from the default/kubernetes Service — the
+// same signal the kubelet and cluster tooling rely on. A missing
+// Service or missing families must yield the unknown family rather
+// than an error, so environments without the Service (some API
+// servers) keep the family-agnostic readiness behavior.
+func TestClusterPrimaryIPFamily(t *testing.T) {
+	t.Parallel()
+
+	newServiceReader := func(t *testing.T, objects ...client.Object) client.Reader {
+		t.Helper()
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatalf("build scheme: %v", err)
+		}
+		return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	}
+	kubernetesService := func(families ...corev1.IPFamily) *corev1.Service {
+		return &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "kubernetes"},
+			Spec:       corev1.ServiceSpec{IPFamilies: families},
+		}
+	}
+
+	t.Run("reads the first family of default/kubernetes", func(t *testing.T) {
+		t.Parallel()
+		reader := newServiceReader(t, kubernetesService(corev1.IPv4Protocol, corev1.IPv6Protocol))
+		got, err := clusterPrimaryIPFamily(t.Context(), reader)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != corev1.IPv4Protocol {
+			t.Errorf("expected the first family IPv4, got %q", got)
+		}
+	})
+
+	t.Run("reports IPv6 for IPv6-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		reader := newServiceReader(t, kubernetesService(corev1.IPv6Protocol))
+		got, err := clusterPrimaryIPFamily(t.Context(), reader)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != corev1.IPv6Protocol {
+			t.Errorf("expected IPv6, got %q", got)
+		}
+	})
+
+	t.Run("reports the unknown family without the Service", func(t *testing.T) {
+		t.Parallel()
+		got, err := clusterPrimaryIPFamily(t.Context(), newServiceReader(t))
+		if err != nil {
+			t.Fatalf("a missing Service must not fail the reconcile: %v", err)
+		}
+		if got != "" {
+			t.Errorf("expected the unknown family, got %q", got)
+		}
+	})
+
+	t.Run("reports the unknown family without reported families", func(t *testing.T) {
+		t.Parallel()
+		reader := newServiceReader(t, kubernetesService())
+		got, err := clusterPrimaryIPFamily(t.Context(), reader)
+		if err != nil {
+			t.Fatalf("missing families must not fail the reconcile: %v", err)
+		}
+		if got != "" {
+			t.Errorf("expected the unknown family, got %q", got)
+		}
+	})
+
+	t.Run("fails the reconcile on reader errors", func(t *testing.T) {
+		t.Parallel()
+		scheme := runtime.NewScheme()
+		if err := corev1.AddToScheme(scheme); err != nil {
+			t.Fatalf("build scheme: %v", err)
+		}
+		reader := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+					return fmt.Errorf("apiserver unreachable")
+				},
+			}).Build()
+		if _, err := clusterPrimaryIPFamily(t.Context(), reader); err == nil {
+			t.Fatal("expected an error for reader failures")
+		}
+	})
+}
+
+// TestPodIPBind verifies which listener binds the kubelet's dial to the
+// pod IP can reach: the wildcard of the pod network's primary family,
+// with :: staying reachable on IPv4 through v4-mapped addresses.
+func TestPodIPBind(t *testing.T) {
+	t.Parallel()
+	bind := func(addr string) *string { return &addr }
+	cases := []struct {
+		name    string
+		bind    *string
+		primary corev1.IPFamily
+		want    bool
+	}{
+		{
+			name:    "default bind reaches an IPv4 pod IP",
+			bind:    nil,
+			primary: corev1.IPv4Protocol,
+			want:    true,
+		},
+		{
+			name:    "default bind cannot reach an IPv6 pod IP",
+			bind:    nil,
+			primary: corev1.IPv6Protocol,
+			want:    false,
+		},
+		{
+			name:    "default bind stays unreachable while the family is unknown",
+			bind:    nil,
+			primary: "",
+			want:    false,
+		},
+		{
+			name:    "IPv4 wildcard reaches an IPv4 pod IP",
+			bind:    bind("0.0.0.0"),
+			primary: corev1.IPv4Protocol,
+			want:    true,
+		},
+		{
+			name:    "IPv4 wildcard cannot reach an IPv6 pod IP",
+			bind:    bind("0.0.0.0"),
+			primary: corev1.IPv6Protocol,
+			want:    false,
+		},
+		{
+			name:    "dual-stack wildcard reaches an IPv4 pod IP via v4-mapped addresses",
+			bind:    bind("::"),
+			primary: corev1.IPv4Protocol,
+			want:    true,
+		},
+		{
+			name:    "dual-stack wildcard reaches an IPv6 pod IP",
+			bind:    bind("::"),
+			primary: corev1.IPv6Protocol,
+			want:    true,
+		},
+		{
+			name:    "dual-stack wildcard stays reachable while the family is unknown",
+			bind:    bind("::"),
+			primary: "",
+			want:    true,
+		},
+		{
+			name:    "IPv4 loopback binds are not pod-IP-reachable",
+			bind:    bind("127.0.0.1"),
+			primary: corev1.IPv4Protocol,
+			want:    false,
+		},
+		{
+			name:    "IPv6 loopback binds are not pod-IP-reachable",
+			bind:    bind("::1"),
+			primary: corev1.IPv6Protocol,
+			want:    false,
+		},
+		{
+			name:    "specific IPv4 binds are not pod-IP-reachable",
+			bind:    bind("10.1.2.3"),
+			primary: corev1.IPv4Protocol,
+			want:    false,
+		},
+		{
+			name:    "specific IPv6 binds are not pod-IP-reachable",
+			bind:    bind("fd00::1"),
+			primary: corev1.IPv6Protocol,
+			want:    false,
+		},
+		{
+			name:    "invalid bind addresses are not pod-IP-reachable",
+			bind:    bind("not-an-ip"),
+			primary: corev1.IPv4Protocol,
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := podIPBind(tc.bind, tc.primary); got != tc.want {
+				t.Errorf("podIPBind(%v, %q) = %v, want %v", tc.bind, tc.primary, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReadinessWildcard verifies the dedicated readiness listener binds
+// the wildcard of the pod network's primary family, falling back to the
+// dual-stack wildcard while the family is unknown.
+func TestReadinessWildcard(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		primary corev1.IPFamily
+		want    string
+	}{
+		{primary: corev1.IPv4Protocol, want: "0.0.0.0"},
+		{primary: corev1.IPv6Protocol, want: "::"},
+		{primary: "", want: "::"},
+	}
+	for _, tc := range cases {
+		if got := readinessWildcard(tc.primary); got != tc.want {
+			t.Errorf("readinessWildcard(%q) = %q, want %q", tc.primary, got, tc.want)
+		}
+	}
+}
+
 func TestRenderProxyConfig_ReadinessListener(t *testing.T) {
 	t.Parallel()
 
 	render := func(t *testing.T, spec *proxyv1alpha1.ProxySpec) nativeConfig {
 		t.Helper()
-		got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default")
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -814,6 +1027,77 @@ func TestRenderProxyConfig_ReadinessListener(t *testing.T) {
 			t.Errorf("readiness chain must avoid the spec chain name, got: %v", readiness.FilterChains)
 		}
 		assertReadinessHealthChain(t, parsed, "readiness-0")
+	})
+}
+
+// TestRenderProxyConfig_ReadinessListenerFamily verifies the readiness
+// path follows the pod network's primary family instead of always
+// relying on a :: bind, which an IPv6-less or IPv6-only pod network
+// cannot serve: on IPv4-primary clusters the default bind is probed
+// directly and the dedicated readiness listener binds the IPv4
+// wildcard, while IPv6-primary clusters keep the dual-stack behavior.
+func TestRenderProxyConfig_ReadinessListenerFamily(t *testing.T) {
+	t.Parallel()
+
+	render := func(t *testing.T, spec *proxyv1alpha1.ProxySpec, primary corev1.IPFamily) nativeConfig {
+		t.Helper()
+		got, err := renderProxyConfig(t.Context(), newRenderReader(t), spec, "default", primary)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		var parsed nativeConfig
+		if err := yaml.Unmarshal([]byte(got.Config), &parsed); err != nil {
+			t.Fatalf("invalid YAML: %v", err)
+		}
+		return parsed
+	}
+
+	t.Run("probes the default bind directly on IPv4-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		// The default bind renders the IPv4 wildcard, which answers the
+		// kubelet's dial to an IPv4 pod IP: no dedicated readiness
+		// listener and no :: bind the pod network may not support.
+		parsed := render(t, readinessRenderSpec(nil), corev1.IPv4Protocol)
+		if len(parsed.Listeners) != 1 {
+			t.Fatalf("expected only the spec listener, got %d", len(parsed.Listeners))
+		}
+		if parsed.Listeners[0].Address != "0.0.0.0:8080" {
+			t.Errorf("spec listener must stay bound per the spec, got: %q", parsed.Listeners[0].Address)
+		}
+	})
+
+	t.Run("binds the IPv4 wildcard readiness listener on IPv4-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		// Loopback binds are unreachable through the pod IP on any
+		// family, so the dedicated listener still renders — bound to
+		// the primary family's wildcard, which an IPv6-less pod network
+		// can always bind.
+		loopback := "127.0.0.1"
+		parsed := render(t, readinessRenderSpec(&loopback), corev1.IPv4Protocol)
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Address != "0.0.0.0:19902" {
+			t.Errorf("readiness listener must bind the primary family's wildcard, got: %q", readiness.Address)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness")
+	})
+
+	t.Run("binds the dual-stack readiness listener on IPv6-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		// The default bind renders the IPv4 wildcard, which never
+		// answers a dial to an IPv6 pod IP: the dedicated listener
+		// renders bound to the dual-stack wildcard.
+		parsed := render(t, readinessRenderSpec(nil), corev1.IPv6Protocol)
+		if len(parsed.Listeners) != 2 {
+			t.Fatalf("expected the spec listener plus the readiness listener, got %d", len(parsed.Listeners))
+		}
+		readiness := parsed.Listeners[1]
+		if readiness.Address != "[::]:19902" {
+			t.Errorf("readiness listener must bind the dual-stack wildcard, got: %q", readiness.Address)
+		}
+		assertReadinessHealthChain(t, parsed, "readiness")
 	})
 }
 

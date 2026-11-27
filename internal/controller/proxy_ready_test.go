@@ -33,7 +33,7 @@ func TestUpdateReadyStatus_DesiredWorkload(t *testing.T) {
 			}
 			deploy := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{Name: proxy.Name, Namespace: proxy.Namespace, Generation: 1},
-				Spec:       appsv1.DeploymentSpec{Replicas: new(int32(1)), Template: buildPodTemplate(proxy, startupRevision)},
+				Spec:       appsv1.DeploymentSpec{Replicas: new(int32(1)), Template: buildPodTemplate(proxy, startupRevision, "")},
 				Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 			}
 			scheme := proxyTestScheme(t)
@@ -67,7 +67,7 @@ func TestUpdateReadyStatus_StaleScale(t *testing.T) {
 	}
 	deploy := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: proxy.Name, Namespace: proxy.Namespace, Generation: 1},
-		Spec:       appsv1.DeploymentSpec{Replicas: new(int32(1)), Template: buildPodTemplate(proxy, startupRevision)},
+		Spec:       appsv1.DeploymentSpec{Replicas: new(int32(1)), Template: buildPodTemplate(proxy, startupRevision, "")},
 		Status:     appsv1.DeploymentStatus{ObservedGeneration: 1, Replicas: 1, UpdatedReplicas: 1, ReadyReplicas: 1},
 	}
 	scheme := proxyTestScheme(t)

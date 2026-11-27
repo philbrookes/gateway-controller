@@ -184,11 +184,13 @@ func TestReconcileResources_RefuseUnownedObjects(t *testing.T) {
 			},
 		},
 		{
-			name:      "deployment without controller owner",
-			existing:  unownedDeployment(),
-			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
-			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
-			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			name:     "deployment without controller owner",
+			existing: unownedDeployment(),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error {
+				return r.reconcileDeployment(ctx, proxy, "rev", "")
+			},
+			key:   types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch: func() client.Object { return &appsv1.Deployment{} },
 			check: func(t *testing.T, got client.Object) {
 				deploy := got.(*appsv1.Deployment)
 				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Image != "user-image:custom" {
@@ -203,11 +205,13 @@ func TestReconcileResources_RefuseUnownedObjects(t *testing.T) {
 			},
 		},
 		{
-			name:      "deployment controlled by another controller",
-			existing:  withForeignOwner(unownedDeployment()),
-			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
-			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
-			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			name:     "deployment controlled by another controller",
+			existing: withForeignOwner(unownedDeployment()),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error {
+				return r.reconcileDeployment(ctx, proxy, "rev", "")
+			},
+			key:   types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch: func() client.Object { return &appsv1.Deployment{} },
 			check: func(t *testing.T, got client.Object) {
 				deploy := got.(*appsv1.Deployment)
 				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Image != "user-image:custom" {
@@ -332,11 +336,13 @@ func TestReconcileResources_MutateOwnedAndCreateObjects(t *testing.T) {
 			},
 		},
 		{
-			name:      "deployment absent is created",
-			existing:  nil,
-			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
-			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
-			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			name:     "deployment absent is created",
+			existing: nil,
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error {
+				return r.reconcileDeployment(ctx, proxy, "rev", "")
+			},
+			key:   types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch: func() client.Object { return &appsv1.Deployment{} },
 			check: func(t *testing.T, got client.Object) {
 				deploy := got.(*appsv1.Deployment)
 				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Name != containerName {
@@ -349,11 +355,13 @@ func TestReconcileResources_MutateOwnedAndCreateObjects(t *testing.T) {
 			},
 		},
 		{
-			name:      "deployment owned by proxy is updated",
-			existing:  withControllerOwner(unownedDeployment(), proxy),
-			reconcile: func(ctx context.Context, r *ProxyReconciler) error { return r.reconcileDeployment(ctx, proxy, "rev") },
-			key:       types.NamespacedName{Namespace: "default", Name: "gw"},
-			fetch:     func() client.Object { return &appsv1.Deployment{} },
+			name:     "deployment owned by proxy is updated",
+			existing: withControllerOwner(unownedDeployment(), proxy),
+			reconcile: func(ctx context.Context, r *ProxyReconciler) error {
+				return r.reconcileDeployment(ctx, proxy, "rev", "")
+			},
+			key:   types.NamespacedName{Namespace: "default", Name: "gw"},
+			fetch: func() client.Object { return &appsv1.Deployment{} },
 			check: func(t *testing.T, got client.Object) {
 				deploy := got.(*appsv1.Deployment)
 				if len(deploy.Spec.Template.Spec.Containers) != 1 || deploy.Spec.Template.Spec.Containers[0].Name != containerName {
@@ -457,7 +465,7 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 		// not reachable through an IPv6 pod IP.
 		dualStack := "::"
 		proxy.Spec.Listeners[0].BindAddress = &dualStack
-		template := buildPodTemplate(proxy, "rev")
+		template := buildPodTemplate(proxy, "rev", "")
 		containers := template.Spec.Containers
 		if len(containers) != 1 {
 			t.Fatalf("containers: %d", len(containers))
@@ -481,7 +489,7 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 			Port:         8081,
 			FilterChains: []string{"main"},
 		})
-		probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe
+		probe := buildPodTemplate(proxy, "rev", "").Spec.Containers[0].ReadinessProbe
 		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "http" {
 			t.Fatalf("probe must target the first listener, got: %+v", probe)
 		}
@@ -491,7 +499,7 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 		t.Parallel()
 		proxy := guardTestProxy()
 		proxy.Spec.Listeners = nil
-		if probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe; probe != nil {
+		if probe := buildPodTemplate(proxy, "rev", "").Spec.Containers[0].ReadinessProbe; probe != nil {
 			t.Errorf("expected no readiness probe without listeners, got: %+v", probe)
 		}
 	})
@@ -508,7 +516,7 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 			BindAddress:  &dualStack,
 			FilterChains: []string{"main"},
 		})
-		probe := buildPodTemplate(proxy, "rev").Spec.Containers[0].ReadinessProbe
+		probe := buildPodTemplate(proxy, "rev", "").Spec.Containers[0].ReadinessProbe
 		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "public" {
 			t.Fatalf("probe must target the first pod-IP-reachable listener, got: %+v", probe)
 		}
@@ -522,7 +530,7 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 		ipv4Wildcard := "0.0.0.0"
 		proxy := guardTestProxy()
 		proxy.Spec.Listeners[0].BindAddress = &ipv4Wildcard
-		template := buildPodTemplate(proxy, "rev")
+		template := buildPodTemplate(proxy, "rev", "")
 		probe := template.Spec.Containers[0].ReadinessProbe
 		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "readiness" {
 			t.Fatalf("probe must target the dedicated readiness listener, got: %+v", probe)
@@ -543,7 +551,60 @@ func TestBuildPodTemplate_ReadinessProbe(t *testing.T) {
 		loopback := "127.0.0.1"
 		proxy := guardTestProxy()
 		proxy.Spec.Listeners[0].BindAddress = &loopback
-		template := buildPodTemplate(proxy, "rev")
+		template := buildPodTemplate(proxy, "rev", "")
+		probe := template.Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "readiness" {
+			t.Fatalf("probe must target the dedicated readiness listener, got: %+v", probe)
+		}
+		var readinessPort int32
+		for _, port := range template.Spec.Containers[0].Ports {
+			if port.Name == "readiness" {
+				readinessPort = port.ContainerPort
+			}
+		}
+		if readinessPort != 19902 {
+			t.Errorf("container must declare the readiness port 19902, got: %d", readinessPort)
+		}
+	})
+
+}
+
+// TestBuildPodTemplate_ReadinessProbeFamily verifies the probe wiring
+// follows the pod network's primary family instead of always relying
+// on a :: bind, which an IPv6-less or IPv6-only pod network cannot
+// serve: on IPv4-primary clusters the default bind is probed directly
+// and the dedicated readiness listener binds the IPv4 wildcard.
+func TestBuildPodTemplate_ReadinessProbeFamily(t *testing.T) {
+	t.Parallel()
+
+	t.Run("probes the default bind directly on IPv4-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		// The default bind renders the IPv4 wildcard, which answers the
+		// kubelet's dial to the pod's IPv4 address: the probe targets
+		// the spec listener and the container declares no dedicated
+		// readiness port.
+		proxy := guardTestProxy()
+		template := buildPodTemplate(proxy, "rev", corev1.IPv4Protocol)
+		probe := template.Spec.Containers[0].ReadinessProbe
+		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "http" {
+			t.Fatalf("probe must target the default-bound listener, got: %+v", probe)
+		}
+		for _, port := range template.Spec.Containers[0].Ports {
+			if port.Name == "readiness" {
+				t.Errorf("container must not declare a readiness port, got: %d", port.ContainerPort)
+			}
+		}
+	})
+
+	t.Run("targets the dedicated readiness listener for loopback binds on IPv4-primary clusters", func(t *testing.T) {
+		t.Parallel()
+		// Loopback binds are unreachable through the pod IP on any
+		// family, so the probe targets the dedicated readiness listener;
+		// it binds the primary family's IPv4 wildcard, not ::.
+		loopback := "127.0.0.1"
+		proxy := guardTestProxy()
+		proxy.Spec.Listeners[0].BindAddress = &loopback
+		template := buildPodTemplate(proxy, "rev", corev1.IPv4Protocol)
 		probe := template.Spec.Containers[0].ReadinessProbe
 		if probe == nil || probe.TCPSocket == nil || probe.TCPSocket.Port.StrVal != "readiness" {
 			t.Fatalf("probe must target the dedicated readiness listener, got: %+v", probe)
