@@ -2,14 +2,18 @@ package controller
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -446,6 +450,62 @@ func fetchConfigMap(t *testing.T, cl client.Client, name string) *corev1.ConfigM
 		t.Fatalf("get configmap %q: %v", name, err)
 	}
 	return cm
+}
+
+// TestReconcileProxy_RenderErrorBoundsConditionMessage verifies the
+// ConfigRenderError conditions stay within the condition-message limit
+// the API server enforces: render errors quote spec content (the
+// reserved-key rejection names the filter entry), and validation does
+// not bound entry-name length, so the raw error can exceed the limit
+// and make the status patch itself fail. Both conditions carry the
+// same bounded, rune-safe message.
+func TestReconcileProxy_RenderErrorBoundsConditionMessage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	// A multibyte entry name long enough to push the render error past
+	// the limit, with the truncation point landing inside a rune: a
+	// naive byte-slice cut would leave invalid UTF-8 in the condition.
+	proxy := guardTestProxy()
+	proxy.Spec.FilterChains[0].Filters[0].Name = "a" + strings.Repeat("€", maxConditionMessageLen)
+	proxy.Spec.FilterChains[0].Filters[0].InlineFilter.Config = &runtime.RawExtension{
+		Raw: []byte(`{"filter":"evil"}`),
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile proxy: %v", err)
+	}
+	got := &proxyv1alpha1.Proxy{}
+	if err := cl.Get(ctx, key, got); err != nil {
+		t.Fatalf("get proxy: %v", err)
+	}
+	for _, conditionType := range []string{
+		proxyv1alpha1.ConditionTypeAccepted, proxyv1alpha1.ConditionTypeResolvedRefs,
+	} {
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, conditionType)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != "ConfigRenderError" {
+			t.Fatalf("%s condition = %+v, want False/ConfigRenderError", conditionType, cond)
+		}
+		if len(cond.Message) > maxConditionMessageLen {
+			t.Errorf("%s message is %d bytes, want at most %d", conditionType, len(cond.Message), maxConditionMessageLen)
+		}
+		if !utf8.ValidString(cond.Message) {
+			t.Errorf("%s message is not valid UTF-8", conditionType)
+		}
+	}
+	accepted := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted)
+	resolved := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs)
+	if accepted.Message != resolved.Message {
+		t.Errorf("Accepted message %q differs from ResolvedRefs message %q", accepted.Message, resolved.Message)
+	}
 }
 
 // TestBuildPodTemplate_ReadinessProbe verifies the generated container

@@ -89,10 +89,15 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 
 	rendered, err := renderProxyConfig(ctx, r.Client, &proxy.Spec, proxy.Namespace, primary)
 	if err != nil {
+		// Render errors quote spec content (filter names, referenced
+		// documents), which validation does not length-bound, so the
+		// message is truncated to what the API server accepts in a
+		// condition before it reaches status.
+		message := truncateToRuneBoundary(err.Error(), maxConditionMessageLen)
 		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeAccepted,
-			metav1.ConditionFalse, "ConfigRenderError", err.Error(), proxy.Generation)
+			metav1.ConditionFalse, "ConfigRenderError", message, proxy.Generation)
 		setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeResolvedRefs,
-			metav1.ConditionFalse, "ConfigRenderError", err.Error(), proxy.Generation)
+			metav1.ConditionFalse, "ConfigRenderError", message, proxy.Generation)
 		if patchErr := r.Status().Patch(ctx, &proxy, patch); patchErr != nil {
 			return ctrl.Result{}, patchErr
 		}
