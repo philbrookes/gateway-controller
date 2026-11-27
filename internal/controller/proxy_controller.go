@@ -152,6 +152,10 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 		return ctrl.Result{}, fmt.Errorf("reconcile service: %w", err)
 	}
 
+	// PublishedRevision is assigned only after both the Deployment and
+	// Service writes have succeeded — the error returns above skip this
+	// assignment — so it records completed publishes, never partial
+	// ones. DesiredRevision, set before the writes, records intent.
 	proxy.Status.PublishedRevision = revision
 	setCondition(&proxy.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed,
 		metav1.ConditionTrue, "ConfigPublished", "Configuration rendered to ConfigMap", proxy.Generation)

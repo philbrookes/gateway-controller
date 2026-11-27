@@ -508,6 +508,73 @@ func TestReconcileProxy_RenderErrorBoundsConditionMessage(t *testing.T) {
 	}
 }
 
+// TestReconcileProxy_PublishedRevisionRecordsCompletedWrites verifies
+// PublishedRevision advances only when every publish write completes:
+// the assignment sits after the Deployment and Service reconciles,
+// whose error returns skip it, so a failed write leaves the previously
+// published revision in status — even when an earlier write in the
+// same reconcile already succeeded.
+func TestReconcileProxy_PublishedRevisionRecordsCompletedWrites(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                     string
+		unowned                  client.Object
+		wantErrSub               string
+		deploymentWriteCompletes bool
+	}{
+		{
+			name:       "deployment write fails",
+			unowned:    unownedDeployment(),
+			wantErrSub: "reconcile deployment:",
+		},
+		{
+			name:                     "service write fails",
+			unowned:                  unownedService(),
+			wantErrSub:               "reconcile service:",
+			deploymentWriteCompletes: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			scheme := proxyTestScheme(t)
+
+			// The proxy carries a revision published by an earlier
+			// reconcile; the failed publish must leave it in place.
+			proxy := guardTestProxy()
+			proxy.Status.PublishedRevision = "published-earlier"
+
+			cl := fake.NewClientBuilder().WithScheme(scheme).
+				WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+				WithObjects(proxy, tc.unowned).Build()
+			r := &ProxyReconciler{Client: cl, Scheme: scheme}
+			key := client.ObjectKeyFromObject(proxy)
+
+			if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err == nil || !strings.Contains(err.Error(), tc.wantErrSub) {
+				t.Fatalf("reconcile error = %v, want one containing %q", err, tc.wantErrSub)
+			}
+			got := &proxyv1alpha1.Proxy{}
+			if err := cl.Get(ctx, key, got); err != nil {
+				t.Fatalf("get proxy: %v", err)
+			}
+			if got.Status.PublishedRevision != "published-earlier" {
+				t.Errorf("PublishedRevision = %q, want the previously published revision", got.Status.PublishedRevision)
+			}
+			if tc.deploymentWriteCompletes {
+				// The Deployment write finished before the Service
+				// write failed: a completed write alone must not
+				// advance PublishedRevision.
+				deploy := &appsv1.Deployment{}
+				if err := cl.Get(ctx, key, deploy); err != nil || !metav1.IsControlledBy(deploy, proxy) {
+					t.Errorf("deployment should be published and controlled before the service write fails, got %v", err)
+				}
+			}
+		})
+	}
+}
+
 // TestBuildPodTemplate_ReadinessProbe verifies the generated container
 // carries a readiness probe wired to a listener the kubelet can reach
 // through the pod IP. The Praxis runtime has no dedicated health
