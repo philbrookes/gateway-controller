@@ -1046,3 +1046,78 @@ func assertLiveConfigMount(t *testing.T, deploy *appsv1.Deployment) {
 		t.Errorf("config volume must reference the live ConfigMap, got %+v", volumes)
 	}
 }
+
+// TestReconcileProxy_ChildNamingAndSelectors pins the derivations the
+// child resources share with each other: the proxy name — validated by
+// the CEL rules on the Proxy type to be a DNS label of at most 63
+// characters — names the Deployment, the Service, and the
+// app.kubernetes.io/instance label value (within the 63-character
+// label-value limit), and the same label set selects the Deployment's
+// pods and the Service's endpoints. Listener names — validated against
+// the IANA_SVC_NAME port-name constraints (15 characters) — are reused
+// as the container port name, the Service port name, and the Service
+// targetPort.
+func TestReconcileProxy_ChildNamingAndSelectors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+	proxy := guardTestProxy()
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+
+	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+		t.Fatalf("reconcile proxy: %v", err)
+	}
+
+	deploy := &appsv1.Deployment{}
+	if err := cl.Get(ctx, key, deploy); err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, key, svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+
+	if deploy.Name != proxy.Name || svc.Name != proxy.Name {
+		t.Errorf("child names = deployment %q, service %q, want the proxy name %q for both", deploy.Name, svc.Name, proxy.Name)
+	}
+	labels := proxyLabels(proxy)
+	if instance := labels["app.kubernetes.io/instance"]; instance != proxy.Name {
+		t.Errorf("app.kubernetes.io/instance = %q, want the proxy name %q", instance, proxy.Name)
+	}
+	if !reflect.DeepEqual(deploy.Spec.Selector.MatchLabels, labels) {
+		t.Errorf("deployment selector = %v, want %v", deploy.Spec.Selector.MatchLabels, labels)
+	}
+	if !reflect.DeepEqual(deploy.Spec.Template.Labels, labels) {
+		t.Errorf("pod template labels = %v, want %v", deploy.Spec.Template.Labels, labels)
+	}
+	if !reflect.DeepEqual(svc.Spec.Selector, labels) {
+		t.Errorf("service selector = %v, want %v", svc.Spec.Selector, labels)
+	}
+
+	var containerPort *corev1.ContainerPort
+	for i := range deploy.Spec.Template.Spec.Containers[0].Ports {
+		if deploy.Spec.Template.Spec.Containers[0].Ports[i].Name == "http" {
+			containerPort = &deploy.Spec.Template.Spec.Containers[0].Ports[i]
+		}
+	}
+	if containerPort == nil {
+		t.Fatalf("container ports %+v have no port named %q", deploy.Spec.Template.Spec.Containers[0].Ports, "http")
+	}
+	if containerPort.ContainerPort != 8080 {
+		t.Errorf("container port = %d, want the listener port 8080", containerPort.ContainerPort)
+	}
+	if len(svc.Spec.Ports) != 1 {
+		t.Fatalf("service ports = %+v, want one", svc.Spec.Ports)
+	}
+	if svc.Spec.Ports[0].Name != "http" || svc.Spec.Ports[0].TargetPort.String() != "http" {
+		t.Errorf("service port = %+v, want name and targetPort to reuse the listener name %q", svc.Spec.Ports[0], "http")
+	}
+	if svc.Spec.Ports[0].Port != 8080 {
+		t.Errorf("service port number = %d, want the listener port 8080", svc.Spec.Ports[0].Port)
+	}
+}
