@@ -28,6 +28,7 @@ const (
 	proxyPollInterval   = 2 * time.Second
 	proxyInitialPort    = int32(18080)
 	proxyUpdatedPort    = int32(18081)
+	adminAPIPort        = 19901
 )
 
 var _ = Describe("Proxy runtime", func() {
@@ -131,6 +132,76 @@ var _ = Describe("Proxy runtime", func() {
 				gom.Expect(body).To(Equal("v2"))
 			}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
 		})
+
+	It("serves the admin interface beyond loopback when opted in", SpecTimeout(5*time.Minute), func(ctx context.Context) {
+		image := os.Getenv("PRAXIS_E2E_IMAGE")
+		Expect(image).NotTo(BeEmpty(), "set PRAXIS_E2E_IMAGE to a verified Praxis runtime image available to the cluster")
+
+		namespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "proxy-e2e-"}}
+		Expect(k8sClient.Create(ctx, namespace)).To(Succeed())
+		DeferCleanup(func(ctx context.Context) error {
+			if CurrentSpecReport().Failed() {
+				dumpProxyDiagnostics(ctx, namespace.Name)
+			}
+			return client.IgnoreNotFound(k8sClient.Delete(ctx, namespace))
+		})
+
+		// The runtime refuses non-loopback admin binds at startup without
+		// its allow_public_admin option, so a Ready proxy proves the
+		// controller rendered the opt-in. The dual-stack wildcard keeps
+		// the interface reachable on both cluster families: the API
+		// server's pod proxy dials the pod's primary-family IP.
+		allowPublic := true
+		proxy := &proxyv1alpha1.Proxy{
+			ObjectMeta: metav1.ObjectMeta{Name: "admin-public", Namespace: namespace.Name},
+			Spec: proxyv1alpha1.ProxySpec{
+				Image: image, Replicas: new(int32(1)),
+				Admin: &proxyv1alpha1.PraxisAdmin{
+					Address: "[::]:" + strconv.Itoa(adminAPIPort),
+				},
+				InsecureOptions: &proxyv1alpha1.PraxisInsecureOptions{AllowPublicAdmin: &allowPublic},
+				Listeners: []proxyv1alpha1.PraxisListener{{
+					Name: "http", Port: proxyInitialPort, FilterChains: []string{"main"},
+				}},
+				FilterChains: []proxyv1alpha1.ProxyFilterChain{{
+					Name: "main",
+					Filters: []proxyv1alpha1.PraxisFilterEntry{{
+						Name: "response", InlineFilter: staticResponse("v1"),
+					}},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, proxy)).To(Succeed())
+		key := client.ObjectKeyFromObject(proxy)
+
+		By("waiting for a running Proxy with the public admin interface")
+		Eventually(func(gom Gomega, ctx context.Context) {
+			expectRuntimeReady(gom, ctx, key)
+		}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
+
+		By("reaching the admin API through the pod IP")
+		Eventually(func(gom Gomega, ctx context.Context) {
+			pods := &corev1.PodList{}
+			gom.Expect(k8sClient.List(ctx, pods, client.InNamespace(key.Namespace))).To(Succeed())
+			var adminPod *corev1.Pod
+			for i := range pods.Items {
+				if pods.Items[i].Status.Phase == corev1.PodRunning && pods.Items[i].Status.PodIP != "" {
+					adminPod = &pods.Items[i]
+				}
+			}
+			gom.Expect(adminPod).NotTo(BeNil(), "the proxy pod must run with a pod IP")
+			_, err := coreClient.Pods(key.Namespace).
+				ProxyGet("http", adminPod.Name, strconv.Itoa(adminAPIPort), "/api/stats", nil).DoRaw(ctx)
+			if err != nil {
+				// Any HTTP answer — including a 404 for an unmounted
+				// stats registry — proves the admin listener accepts
+				// connections on the pod IP; only a refused dial means
+				// the public bind did not take effect.
+				gom.Expect(err.Error()).NotTo(ContainSubstring("connection refused"),
+					"the admin API must answer beyond loopback: %v", err)
+			}
+		}).WithContext(ctx).WithTimeout(proxyStartupTimeout).WithPolling(proxyPollInterval).Should(Succeed())
+	})
 })
 
 func staticResponse(body string) *proxyv1alpha1.PraxisInlineFilter {

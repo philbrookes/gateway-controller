@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"unicode/utf8"
 
@@ -72,7 +73,34 @@ func validateProxySpec(spec *proxyv1alpha1.ProxySpec) []string {
 		}
 	}
 
+	if adminBindRequiresOptIn(spec.Admin, spec.InsecureOptions) {
+		errs = append(errs, fmt.Sprintf(
+			"spec.admin.address: %q binds the admin interface, which performs no authentication, beyond loopback; set spec.insecureOptions.allowPublicAdmin or bind a loopback address",
+			spec.Admin.Address))
+	}
+
 	return errs
+}
+
+// adminBindRequiresOptIn reports whether the spec binds the admin
+// interface beyond loopback without opting in: the Praxis runtime
+// rejects non-loopback admin binds at startup without its
+// allow_public_admin option, so publishing them would crash-loop the
+// runtime. Loopback follows the runtime's rule — 127.0.0.0/8, ::1, and
+// IPv4-mapped loopback addresses.
+func adminBindRequiresOptIn(admin *proxyv1alpha1.PraxisAdmin, options *proxyv1alpha1.PraxisInsecureOptions) bool {
+	if admin == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(admin.Address)
+	if err != nil {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsLoopback() {
+		return false
+	}
+	return options == nil || options.AllowPublicAdmin == nil || !*options.AllowPublicAdmin
 }
 
 func joinValidationErrors(errs []string) string {

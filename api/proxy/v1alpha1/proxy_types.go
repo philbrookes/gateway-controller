@@ -178,6 +178,13 @@ type PraxisInsecureOptions struct {
 	// allowUnboundedBody disables body size limits.
 	// +optional
 	AllowUnboundedBody *bool `json:"allowUnboundedBody,omitempty"`
+
+	// allowPublicAdmin permits the admin interface to bind non-loopback
+	// addresses, rendered as the Praxis allow_public_admin option. The
+	// admin interface performs no authentication, so the controller only
+	// publishes non-loopback admin binds when this is set.
+	// +optional
+	AllowPublicAdmin *bool `json:"allowPublicAdmin,omitempty"`
 }
 
 // ProxyStatus reports published and serving revision state.

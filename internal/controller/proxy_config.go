@@ -247,6 +247,7 @@ type nativeAdmin struct {
 type nativeInsecure struct {
 	AllowPrivateEndpoints *bool `json:"allow_private_endpoints,omitempty"`
 	AllowUnboundedBody    *bool `json:"allow_unbounded_body,omitempty"`
+	AllowPublicAdmin      *bool `json:"allow_public_admin,omitempty"`
 }
 
 type nativeListener struct {
@@ -294,6 +295,7 @@ func renderProxyConfig(ctx context.Context, reader client.Reader, spec *proxyv1a
 		cfg.InsecureOptions = &nativeInsecure{
 			AllowPrivateEndpoints: spec.InsecureOptions.AllowPrivateEndpoints,
 			AllowUnboundedBody:    spec.InsecureOptions.AllowUnboundedBody,
+			AllowPublicAdmin:      spec.InsecureOptions.AllowPublicAdmin,
 		}
 	}
 

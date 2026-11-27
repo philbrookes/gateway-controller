@@ -506,6 +506,13 @@ spec:
                     description: allowPrivateEndpoints permits routing to RFC 1918
                       addresses.
                     type: boolean
+                  allowPublicAdmin:
+                    description: |-
+                      allowPublicAdmin permits the admin interface to bind non-loopback
+                      addresses, rendered as the Praxis allow_public_admin option. The
+                      admin interface performs no authentication, so the controller only
+                      publishes non-loopback admin binds when this is set.
+                    type: boolean
                   allowUnboundedBody:
                     description: allowUnboundedBody disables body size limits.
                     type: boolean

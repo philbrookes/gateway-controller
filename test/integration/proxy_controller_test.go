@@ -476,6 +476,50 @@ var _ = Describe("Proxy Controller", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
+	It("rejects a public admin bind without the opt-in", func(ctx context.Context) {
+		proxy := validProxy("admin-public")
+		// The Praxis runtime refuses non-loopback admin binds at startup
+		// without its allow_public_admin option, so the controller must
+		// reject the spec before publishing a crash-looping config.
+		proxy.Spec.Admin = &proxyv1alpha1.PraxisAdmin{Address: "0.0.0.0:19901"}
+		createProxy(ctx, proxy)
+
+		expectValidationError(ctx, proxy, "allowPublicAdmin")
+
+		cm := &corev1.ConfigMap{}
+		err := k8sClient.Get(ctx, types.NamespacedName{
+			Name:      proxy.Name + "-config",
+			Namespace: proxy.Namespace,
+		}, cm)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("publishes a public admin bind with the opt-in", func(ctx context.Context) {
+		proxy := validProxy("admin-public-optin")
+		allowPublic := true
+		proxy.Spec.Admin = &proxyv1alpha1.PraxisAdmin{Address: "0.0.0.0:19901"}
+		proxy.Spec.InsecureOptions = &proxyv1alpha1.PraxisInsecureOptions{AllowPublicAdmin: &allowPublic}
+		createProxy(ctx, proxy)
+
+		Eventually(func(gom Gomega, ctx context.Context) {
+			got := &proxyv1alpha1.Proxy{}
+			gom.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(proxy), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+			gom.Expect(cond).NotTo(BeNil())
+			gom.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			cm := &corev1.ConfigMap{}
+			gom.Expect(k8sClient.Get(ctx, types.NamespacedName{
+				Name:      proxy.Name + "-config",
+				Namespace: proxy.Namespace,
+			}, cm)).To(Succeed())
+			// The opt-in must reach the rendered Praxis config: the
+			// runtime only accepts the non-loopback admin bind with its
+			// allow_public_admin option present.
+			gom.Expect(cm.Data["config.yaml"]).To(ContainSubstring("allow_public_admin: true"))
+			gom.Expect(cm.Data["config.yaml"]).To(ContainSubstring("19901"))
+		}).WithContext(ctx).WithTimeout(proxyReconcileTimeout).Should(Succeed())
+	})
+
 	It("should not adopt a pre-existing ConfigMap it does not control", func(ctx context.Context) {
 		const proxyName = "adopt-guard"
 		// A user-managed ConfigMap already occupies the name the controller

@@ -55,18 +55,23 @@ func TestRenderProxyConfig_Minimal(t *testing.T) {
 	if parsed.Listeners[1].Name != "readiness" || parsed.Listeners[1].Address != "[::]:19902" {
 		t.Errorf("expected the dual-stack readiness listener, got %+v", parsed.Listeners[1])
 	}
+	if parsed.InsecureOptions != nil {
+		t.Error("expected no insecure_options block without the spec opting in")
+	}
 }
 
 func TestRenderProxyConfig_AdminAndInsecure(t *testing.T) {
 	t.Parallel()
 	allowPriv := true
 	denyUnbounded := false
+	allowPublic := true
 	spec := &proxyv1alpha1.ProxySpec{
 		Image: "ghcr.io/praxis-proxy/praxis:latest",
 		Admin: &proxyv1alpha1.PraxisAdmin{Address: "127.0.0.1:19901"},
 		InsecureOptions: &proxyv1alpha1.PraxisInsecureOptions{
 			AllowPrivateEndpoints: &allowPriv,
 			AllowUnboundedBody:    &denyUnbounded,
+			AllowPublicAdmin:      &allowPublic,
 		},
 		Listeners: []proxyv1alpha1.PraxisListener{{Name: "http", Port: 8080}},
 	}
@@ -89,6 +94,9 @@ func TestRenderProxyConfig_AdminAndInsecure(t *testing.T) {
 	}
 	if parsed.InsecureOptions.AllowUnboundedBody == nil || *parsed.InsecureOptions.AllowUnboundedBody {
 		t.Error("expected allow_unbounded_body=false")
+	}
+	if parsed.InsecureOptions.AllowPublicAdmin == nil || !*parsed.InsecureOptions.AllowPublicAdmin {
+		t.Error("expected allow_public_admin=true")
 	}
 }
 
