@@ -241,6 +241,23 @@ func TestRetainedFamilyConflict(t *testing.T) {
 			binds:       []*string{bind("::"), bind("0.0.0.0")},
 			wantMessage: []string{`listener "l1"`, "0.0.0.0", "IPv6"},
 		},
+		{
+			name:     "a dual-stack Service accepts the mixed binds that requested it",
+			families: []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
+			binds:    []*string{bind("0.0.0.0"), bind("fd00::1")},
+		},
+		{
+			name:        "a dual-stack Service rejects an IPv6-only spec",
+			families:    []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol},
+			binds:       []*string{bind("fd00::1")},
+			wantMessage: []string{`listener "l0"`, "fd00::1", "IPv4"},
+		},
+		{
+			name:        "an IPv4 Service rejects a spec that adds IPv6",
+			families:    []corev1.IPFamily{corev1.IPv4Protocol},
+			binds:       []*string{bind("0.0.0.0"), bind("fd00::1")},
+			wantMessage: []string{`listener "l1"`, "fd00::1", "requires IPv6"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -359,5 +376,58 @@ func TestReconcileProxy_ServiceFamilyConflict(t *testing.T) {
 	}
 	if !reflect.DeepEqual(svcAfter.Spec.IPFamilies, []corev1.IPFamily{corev1.IPv6Protocol}) {
 		t.Errorf("service families = %v, want the retained [IPv6]", svcAfter.Spec.IPFamilies)
+	}
+}
+
+// TestReconcileProxy_MixedBindsReconcileIdempotently pins the follow-up
+// finding on family handling: mixed IPv4-only and IPv6-only binds
+// legitimately request a dual-stack Service (no single family serves
+// every listener), and once the Service has allocated exactly those
+// families, the unchanged spec keeps requesting them. Every later
+// reconcile must stay published — the family request and the retained
+// allocation agree, so none may report a conflict — and the Service
+// must keep the families it allocated.
+func TestReconcileProxy_MixedBindsReconcileIdempotently(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	scheme := proxyTestScheme(t)
+
+	v4Bind, v6Bind := "0.0.0.0", "fd00::1"
+	proxy := guardTestProxy()
+	proxy.Spec.Listeners = []proxyv1alpha1.PraxisListener{
+		{Name: "http", Port: 8080, BindAddress: &v4Bind, FilterChains: []string{"main"}},
+		{Name: "http6", Port: 8081, BindAddress: &v6Bind, FilterChains: []string{"main"}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).
+		WithStatusSubresource(&proxyv1alpha1.Proxy{}).
+		WithObjects(proxy).Build()
+	r := &ProxyReconciler{Client: cl, Scheme: scheme}
+	key := client.ObjectKeyFromObject(proxy)
+
+	for reconcile := 1; reconcile <= 3; reconcile++ {
+		if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
+			t.Fatalf("reconcile %d: %v", reconcile, err)
+		}
+		got := &proxyv1alpha1.Proxy{}
+		if err := cl.Get(ctx, key, got); err != nil {
+			t.Fatalf("get proxy after reconcile %d: %v", reconcile, err)
+		}
+		cond := apimeta.FindStatusCondition(got.Status.Conditions, proxyv1alpha1.ConditionTypeProgrammed)
+		if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != "ConfigPublished" {
+			t.Fatalf("reconcile %d: Programmed condition = %+v, want True/ConfigPublished (the spec still requests the families the Service allocated)", reconcile, cond)
+		}
+	}
+
+	svc := &corev1.Service{}
+	if err := cl.Get(ctx, key, svc); err != nil {
+		t.Fatalf("get service: %v", err)
+	}
+	want := []corev1.IPFamily{corev1.IPv4Protocol, corev1.IPv6Protocol}
+	if !reflect.DeepEqual(svc.Spec.IPFamilies, want) {
+		t.Errorf("service families = %v, want the requested %v", svc.Spec.IPFamilies, want)
+	}
+	if svc.Spec.IPFamilyPolicy == nil || *svc.Spec.IPFamilyPolicy != corev1.IPFamilyPolicyPreferDualStack {
+		t.Errorf("family policy = %v, want PreferDualStack", svc.Spec.IPFamilyPolicy)
 	}
 }

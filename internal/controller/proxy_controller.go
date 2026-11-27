@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -150,7 +151,8 @@ func (r *ProxyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl
 	proxy.Status.DesiredRevision = revision
 
 	// A Service's allocated families are immutable, so a bind change
-	// that drops a retained family can never be published while that
+	// that would change them — dropping a family the Service retains
+	// or adding one it lacks — can never be published while that
 	// Service exists. Reject the change before the ConfigMap and
 	// Deployment are updated, and report it in status rather than
 	// failing after they are already published.
@@ -591,35 +593,77 @@ func serviceIPFamilies(proxy *proxyv1alpha1.Proxy) ([]corev1.IPFamily, corev1.IP
 	}
 }
 
-// retainedFamilyConflict reports the listeners that cannot accept
-// traffic on a family the existing Service already allocated. Service
-// IP families are immutable, so a bind that drops a retained family
-// can never be published while that Service exists; the caller rejects
-// the change before publishing configuration or workloads. A Service
-// with no allocated families constrains nothing.
+// retainedFamilyConflict reports a spec whose Service family request
+// cannot be met by the existing Service. The request is the family set
+// serviceIPFamilies computes and reconcileService writes, so the two
+// stay consistent: a spec that keeps requesting exactly the allocated
+// families never conflicts — including mixed single-family binds,
+// where each family serves only the listeners that accept it and the
+// dual-stack Service carries traffic for both. Service IP families are
+// immutable, so a request that changes the allocated set — dropping a
+// family the Service retains, or adding one it lacks — can never be
+// published while that Service exists; the caller rejects the change
+// before publishing configuration or workloads. A spec that leaves the
+// families for the cluster to choose accepts any allocation, and a
+// Service with no allocated families constrains nothing.
 func retainedFamilyConflict(proxy *proxyv1alpha1.Proxy, svc *corev1.Service) error {
-	retained := make([]string, 0, len(svc.Spec.IPFamilies))
+	if len(svc.Spec.IPFamilies) == 0 {
+		return nil
+	}
+	desired, _ := serviceIPFamilies(proxy)
+	if desired == nil || slices.Equal(desired, svc.Spec.IPFamilies) {
+		return nil
+	}
+	dropped := familiesOnlyIn(svc.Spec.IPFamilies, desired)
+	added := familiesOnlyIn(desired, svc.Spec.IPFamilies)
 	var conflicts []string
-	for _, family := range svc.Spec.IPFamilies {
-		retained = append(retained, string(family))
-		for i := range proxy.Spec.Listeners {
-			listener := &proxy.Spec.Listeners[i]
-			acceptsV4, acceptsV6 := listenerBindFamilies(listener.BindAddress)
-			if (family == corev1.IPv4Protocol && acceptsV4) || (family == corev1.IPv6Protocol && acceptsV6) {
-				continue
+	for i := range proxy.Spec.Listeners {
+		listener := &proxy.Spec.Listeners[i]
+		acceptsV4, acceptsV6 := listenerBindFamilies(listener.BindAddress)
+		bind := "0.0.0.0" // the spec default for an unset bind
+		if listener.BindAddress != nil {
+			bind = *listener.BindAddress
+		}
+		for _, family := range dropped {
+			if (family == corev1.IPv4Protocol && !acceptsV4) || (family == corev1.IPv6Protocol && !acceptsV6) {
+				conflicts = append(conflicts, fmt.Sprintf("listener %q binds %s, which does not accept %s", listener.Name, bind, family))
 			}
-			bind := "0.0.0.0" // the spec default for an unset bind
-			if listener.BindAddress != nil {
-				bind = *listener.BindAddress
+		}
+		for _, family := range added {
+			if (family == corev1.IPv4Protocol && acceptsV4 && !acceptsV6) || (family == corev1.IPv6Protocol && acceptsV6 && !acceptsV4) {
+				conflicts = append(conflicts, fmt.Sprintf("listener %q binds %s, which requires %s", listener.Name, bind, family))
 			}
-			conflicts = append(conflicts, fmt.Sprintf("listener %q binds %s, which does not accept %s", listener.Name, bind, family))
 		}
 	}
 	if len(conflicts) == 0 {
-		return nil
+		// Every dropped or added family has a listener that no longer
+		// accepts it or now requires it, except a spec whose listeners
+		// were removed entirely; name the difference anyway so the
+		// condition always explains the conflict.
+		conflicts = append(conflicts, fmt.Sprintf("the spec requests %s while no listener binds them", familyList(desired)))
 	}
-	return fmt.Errorf("the Service %s/%s retains %s, but %s; Service IP families are immutable, so revert the bindAddress or delete the Service to reallocate",
-		svc.Namespace, svc.Name, strings.Join(retained, ", "), strings.Join(conflicts, "; "))
+	return fmt.Errorf("the Service %s/%s retains %s, but the proxy requests %s (%s); Service IP families are immutable, so revert the bindAddress or delete the Service to reallocate",
+		svc.Namespace, svc.Name, familyList(svc.Spec.IPFamilies), familyList(desired), strings.Join(conflicts, "; "))
+}
+
+// familiesOnlyIn returns the families of a that b does not contain.
+func familiesOnlyIn(a, b []corev1.IPFamily) []corev1.IPFamily {
+	var only []corev1.IPFamily
+	for _, family := range a {
+		if !slices.Contains(b, family) {
+			only = append(only, family)
+		}
+	}
+	return only
+}
+
+// familyList renders families for a condition message.
+func familyList(families []corev1.IPFamily) string {
+	parts := make([]string, 0, len(families))
+	for _, family := range families {
+		parts = append(parts, string(family))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // listenerBindFamilies reports which address families a listener's bind
