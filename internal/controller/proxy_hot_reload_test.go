@@ -225,20 +225,33 @@ func TestReconcileProxy_UnchangedReconcileSkipsDeploymentUpdate(t *testing.T) {
 	reconcile()
 
 	// Simulate the API server's pod-template defaulting on the stored
-	// Deployment: an empty securityContext and defaultMode 0644 on the
-	// ConfigMap and Secret volumes.
+	// Deployment — the fields a real API server fills in when they are
+	// left unset on a pod template (observed on a kind cluster): an
+	// empty securityContext and resources, defaultMode 0644 on the
+	// ConfigMap and Secret volumes, the pull policy and termination
+	// message on the container, and the restart policy, DNS policy,
+	// scheduler, and termination grace period on the pod. The rendered
+	// template must match every one of them, or an unchanged reconcile
+	// diffs against the stored object and churns updates.
 	deploy := &appsv1.Deployment{}
 	if err := cl.Get(ctx, key, deploy); err != nil {
 		t.Fatalf("get deployment: %v", err)
 	}
 	deploy.Spec.Template.Spec.SecurityContext = &corev1.PodSecurityContext{}
+	deploy.Spec.Template.Spec.RestartPolicy = corev1.RestartPolicyAlways
+	deploy.Spec.Template.Spec.DNSPolicy = corev1.DNSClusterFirst
+	deploy.Spec.Template.Spec.SchedulerName = corev1.DefaultSchedulerName
+	deploy.Spec.Template.Spec.TerminationGracePeriodSeconds = new(defaultTerminationGracePeriod)
+	deploy.Spec.Template.Spec.Containers[0].ImagePullPolicy = corev1.PullIfNotPresent
+	deploy.Spec.Template.Spec.Containers[0].TerminationMessagePath = corev1.TerminationMessagePathDefault
+	deploy.Spec.Template.Spec.Containers[0].TerminationMessagePolicy = corev1.TerminationMessageReadFile
 	for i := range deploy.Spec.Template.Spec.Volumes {
 		vol := &deploy.Spec.Template.Spec.Volumes[i]
 		switch {
 		case vol.ConfigMap != nil:
-			vol.ConfigMap.DefaultMode = new(int32(0o644))
+			vol.ConfigMap.DefaultMode = new(int32(volumeDefaultMode))
 		case vol.Secret != nil:
-			vol.Secret.DefaultMode = new(int32(0o644))
+			vol.Secret.DefaultMode = new(int32(volumeDefaultMode))
 		}
 	}
 	if err := cl.Update(ctx, deploy); err != nil {

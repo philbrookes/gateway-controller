@@ -339,6 +339,16 @@ func proxyLabels(proxy *proxyv1alpha1.Proxy) map[string]string {
 	}
 }
 
+// buildPodTemplate returns the pod template for the Praxis Deployment.
+// reconcileDeployment replaces the stored template wholesale, so every
+// field the API server defaults on a stored pod template — pull policy
+// and termination message on the container; restart policy, DNS
+// policy, scheduler, termination grace period, security context, and
+// volume defaultMode on the pod — is rendered here with the value the
+// server defaults it to. An unrendered default would differ from the
+// stored object on every reconcile and churn Deployment updates;
+// TestReconcileProxy_UnchangedReconcileSkipsDeploymentUpdate simulates
+// the server's defaulting and fails if an unchanged reconcile writes.
 func buildPodTemplate(proxy *proxyv1alpha1.Proxy, revision string, primary corev1.IPFamily) corev1.PodTemplateSpec {
 	volumes, mounts := buildVolumes(proxy)
 	gracePeriod := defaultTerminationGracePeriod
